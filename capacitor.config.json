@@ -1,0 +1,9 @@
+{
+  "appId": "com.skipcast.app",
+  "appName": "SkipCast",
+  "webDir": "dist",
+  "bundledWebRuntime": false,
+  "server": {
+    "androidScheme": "https"
+  }
+}
