@@ -24,15 +24,17 @@ jobs:
           distribution: 'temurin'
           java-version: '21'
 
-      - name: Install dependencies & build web bundle
+      - name: Install dependencies, Native MediaSession plugin & build web bundle
         run: |
-          npm install
+          npm install --legacy-peer-deps
+          npm install @jofr/capacitor-media-session --legacy-peer-deps
           npm run build
 
-      - name: Initialize Capacitor Android platform
+      - name: Initialize Capacitor Android platform & inject Media Notification permissions
         run: |
           npx cap add android
           npx cap sync android
+          sed -i 's/<uses-permission android:name="android.permission.INTERNET" \/>/<uses-permission android:name="android.permission.INTERNET" \/>\n    <uses-permission android:name="android.permission.WAKE_LOCK" \/>\n    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" \/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" \/>\n    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" \/>/g' android/app/src/main/AndroidManifest.xml
 
       - name: Compile Debug APK with Gradle
         working-directory: ./android
