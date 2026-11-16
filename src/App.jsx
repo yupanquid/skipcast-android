@@ -5,7 +5,9 @@ import {
   Search, Download, CheckCircle2, Trash2, WifiOff, Rss,
   Plus, Check, FolderUp, FileDown, ArrowLeft, ListPlus, ChevronRight
 } from 'lucide-react';
-import { MediaSession } from '@jofr/capacitor-media-session';
+
+// Access Capacitor Native MediaSession plugin safely at runtime without breaking Vite build
+const getNativeMediaSession = () => window.Capacitor?.Plugins?.MediaSession || null;
 
 const DEFAULT_ARTWORK = 'https://images.unsplash.com/photo-1590602847861-f357a9332bbc?w=512&q=80';
 
@@ -31,7 +33,6 @@ const INITIAL_EPISODES = [
   }
 ];
 
-// IndexedDB helper for storing full MP3 files AND 50+ episode show caches
 const DB_NAME = 'SkipCastOfflineDB_v6';
 const AUDIO_STORE = 'audioFiles';
 const FEED_CACHE_STORE = 'showEpisodesCache';
@@ -119,7 +120,6 @@ const getShowArchiveCache = async (feedUrl) => {
   }
 };
 
-// Fetch RSS XML with fallback proxies for Android WebView CORS compatibility
 const fetchFeedXmlText = async (feedUrl) => {
   let xmlText = '';
   try {
@@ -174,7 +174,6 @@ export default function App() {
     return localStorage.getItem('skipcast_active_ep') || INITIAL_EPISODES[0].id;
   });
 
-  // Inner Podcast Show View State (displays 50-60 episodes per show)
   const [selectedPodcast, setSelectedPodcast] = useState(null);
   const [selectedPodcastEpisodes, setSelectedPodcastEpisodes] = useState([]);
   const [isLoadingShowEps, setIsLoadingShowEps] = useState(false);
@@ -260,7 +259,6 @@ export default function App() {
     getAllOfflineKeys().then(keys => setOfflineIds(keys));
   }, []);
 
-  // Load new episode into HTML5 Audio (preferring offline IndexedDB blob if downloaded)
   useEffect(() => {
     let isCancelled = false;
     const loadAudioSource = async () => {
@@ -301,7 +299,7 @@ export default function App() {
     return () => { isCancelled = true; };
   }, [currentEpId]);
 
-  // NATIVE ANDROID + WEB MEDIASESSION BRIDGE (Quick Settings Tile, Lock Screen, Notification Shade)
+  // NATIVE ANDROID + WEB MEDIASESSION BRIDGE
   useEffect(() => {
     if (!currentEp) return;
     const artUrl = currentEp.artwork || DEFAULT_ARTWORK;
@@ -314,73 +312,67 @@ export default function App() {
       ]
     };
 
-    // 1. Trigger Native Android Foreground Media Service Notification via Capacitor Plugin
     const syncNativeMediaSession = async () => {
-      try {
-        await MediaSession.setMetadata(metaPayload);
-
-        await MediaSession.setActionHandler({ action: 'play' }, async () => {
-          if (audioRef.current) {
-            await audioRef.current.play();
-            setIsPlaying(true);
-          }
-        });
-
-        await MediaSession.setActionHandler({ action: 'pause' }, () => {
-          if (audioRef.current) {
-            audioRef.current.pause();
-            setIsPlaying(false);
-          }
-        });
-
-        await MediaSession.setActionHandler({ action: 'seekbackward' }, (details) => {
-          const offset = details?.seekOffset || 15;
-          if (audioRef.current) {
-            const next = Math.max(0, audioRef.current.currentTime - offset);
-            audioRef.current.currentTime = next;
-            setCurrentTime(next);
-          }
-        });
-
-        await MediaSession.setActionHandler({ action: 'seekforward' }, (details) => {
-          const offset = details?.seekOffset || 30;
-          if (audioRef.current) {
-            const next = Math.min(duration || 3600, audioRef.current.currentTime + offset);
-            audioRef.current.currentTime = next;
-            setCurrentTime(next);
-          }
-        });
-
-        await MediaSession.setActionHandler({ action: 'seekto' }, (details) => {
-          if (audioRef.current && details?.seekTime != null) {
-            lastSkippedAdRef.current = null;
-            audioRef.current.currentTime = details.seekTime;
-            setCurrentTime(details.seekTime);
-          }
-        });
-
-        await MediaSession.setActionHandler({ action: 'nexttrack' }, () => {
-          if (audioRef.current) {
-            const now = audioRef.current.currentTime;
-            const activeAd = currentEp.ads?.find(a => now >= a.startTime && now < a.endTime);
-            const target = activeAd ? activeAd.endTime : Math.min(duration || 3600, now + 30);
-            audioRef.current.currentTime = target;
-            setCurrentTime(target);
-          }
-        });
-
-        await MediaSession.setActionHandler({ action: 'previoustrack' }, () => {
-          if (audioRef.current) {
-            const next = Math.max(0, audioRef.current.currentTime - 15);
-            audioRef.current.currentTime = next;
-            setCurrentTime(next);
-          }
-        });
-      } catch (_) {}
+      const NativeMedia = getNativeMediaSession();
+      if (NativeMedia) {
+        try {
+          await NativeMedia.setMetadata(metaPayload);
+          await NativeMedia.setActionHandler({ action: 'play' }, async () => {
+            if (audioRef.current) {
+              await audioRef.current.play();
+              setIsPlaying(true);
+            }
+          });
+          await NativeMedia.setActionHandler({ action: 'pause' }, () => {
+            if (audioRef.current) {
+              audioRef.current.pause();
+              setIsPlaying(false);
+            }
+          });
+          await NativeMedia.setActionHandler({ action: 'seekbackward' }, (details) => {
+            const offset = details?.seekOffset || 15;
+            if (audioRef.current) {
+              const next = Math.max(0, audioRef.current.currentTime - offset);
+              audioRef.current.currentTime = next;
+              setCurrentTime(next);
+            }
+          });
+          await NativeMedia.setActionHandler({ action: 'seekforward' }, (details) => {
+            const offset = details?.seekOffset || 30;
+            if (audioRef.current) {
+              const next = Math.min(duration || 3600, audioRef.current.currentTime + offset);
+              audioRef.current.currentTime = next;
+              setCurrentTime(next);
+            }
+          });
+          await NativeMedia.setActionHandler({ action: 'seekto' }, (details) => {
+            if (audioRef.current && details?.seekTime != null) {
+              lastSkippedAdRef.current = null;
+              audioRef.current.currentTime = details.seekTime;
+              setCurrentTime(details.seekTime);
+            }
+          });
+          await NativeMedia.setActionHandler({ action: 'nexttrack' }, () => {
+            if (audioRef.current) {
+              const now = audioRef.current.currentTime;
+              const activeAd = currentEp.ads?.find(a => now >= a.startTime && now < a.endTime);
+              const target = activeAd ? activeAd.endTime : Math.min(duration || 3600, now + 30);
+              audioRef.current.currentTime = target;
+              setCurrentTime(target);
+            }
+          });
+          await NativeMedia.setActionHandler({ action: 'previoustrack' }, () => {
+            if (audioRef.current) {
+              const next = Math.max(0, audioRef.current.currentTime - 15);
+              audioRef.current.currentTime = next;
+              setCurrentTime(next);
+            }
+          });
+        } catch (_) {}
+      }
     };
     syncNativeMediaSession();
 
-    // 2. Also populate Web MediaSession as fallback
     if ('mediaSession' in navigator) {
       try {
         navigator.mediaSession.metadata = new window.MediaMetadata(metaPayload);
@@ -388,12 +380,14 @@ export default function App() {
     }
   }, [currentEp, autoSkip, duration]);
 
-  // Keep Native Android Notification PlaybackState synced
   useEffect(() => {
     const stateStr = isPlaying ? 'playing' : 'paused';
-    try {
-      MediaSession.setPlaybackState({ playbackState: stateStr });
-    } catch (_) {}
+    const NativeMedia = getNativeMediaSession();
+    if (NativeMedia) {
+      try {
+        NativeMedia.setPlaybackState({ playbackState: stateStr });
+      } catch (_) {}
+    }
     if ('mediaSession' in navigator) {
       navigator.mediaSession.playbackState = stateStr;
     }
@@ -428,15 +422,17 @@ export default function App() {
 
     const validDur = audio.duration && isFinite(audio.duration) ? audio.duration : duration;
     if (validDur > 0 && now <= validDur) {
-      // Update Native Android Notification scrubber position every ~1 second
       if (Math.floor(now) !== Math.floor(now - 0.25)) {
-        try {
-          MediaSession.setPositionState({
-            duration: validDur,
-            playbackRate: audio.playbackRate || 1.0,
-            position: now
-          });
-        } catch (_) {}
+        const NativeMedia = getNativeMediaSession();
+        if (NativeMedia) {
+          try {
+            NativeMedia.setPositionState({
+              duration: validDur,
+              playbackRate: audio.playbackRate || 1.0,
+              position: now
+            });
+          } catch (_) {}
+        }
       }
     }
 
@@ -544,7 +540,6 @@ export default function App() {
       return;
     }
 
-    // Ensure episode is in Queue when downloaded offline
     setEpisodes(prev => {
       if (prev.some(item => item.id === ep.id || item.audioUrl === ep.audioUrl)) return prev;
       return [ep, ...prev];
@@ -592,7 +587,6 @@ export default function App() {
     }
   };
 
-  // Parse up to 60 episodes per podcast RSS feed
   const parseFeedXml = (xmlText, feedUrl, fallbackArt, maxItems = 60) => {
     const parser = new DOMParser();
     const xml = parser.parseFromString(xmlText, 'text/xml');
@@ -613,7 +607,6 @@ export default function App() {
       const desc = item.querySelector('description')?.textContent?.replace(/<[^>]+>/g, '') || '';
       const epArt = item.getElementsByTagName('itunes:image')?.[0]?.getAttribute('href') || channelArt;
 
-      // Parse iTunes duration tag if present (HH:MM:SS or seconds)
       let parsedDur = 1800;
       const durStr = item.getElementsByTagName('itunes:duration')?.[0]?.textContent?.trim();
       if (durStr) {
@@ -650,7 +643,6 @@ export default function App() {
     return { channelTitle, channelDesc, channelArt, parsedEps };
   };
 
-  // Open Inner 60-Episode Browser for a Subscribed Show
   const openPodcastShowView = async (sub, forceRefresh = false) => {
     setSelectedPodcast(sub);
     setEpisodeFilterQuery('');
@@ -672,7 +664,6 @@ export default function App() {
         setSelectedPodcastEpisodes(parsedEps);
         await saveShowArchiveCache(sub.feedUrl, parsedEps);
 
-        // Update show artwork & episode count in subscriptions list
         setSubscriptions(prev => prev.map(s => s.id === sub.id ? {
           ...s,
           title: s.title === 'Subscribed Podcast' ? channelTitle : s.title,
@@ -689,7 +680,6 @@ export default function App() {
     }
   };
 
-  // Play an episode directly from the 60-episode Show View
   const playEpisodeFromShow = (ep) => {
     setEpisodes(prev => {
       const exists = prev.find(item => item.audioUrl === ep.audioUrl || item.id === ep.id);
@@ -703,7 +693,6 @@ export default function App() {
     setActiveTab('player');
   };
 
-  // Add an episode from the Show View to Queue without interrupting current playback
   const addEpisodeToQueue = (ep, e) => {
     if (e) e.stopPropagation();
     const alreadyInQueue = episodes.some(item => item.audioUrl === ep.audioUrl || item.id === ep.id);
@@ -760,7 +749,6 @@ export default function App() {
           episodeCount: parsedEps.length
         } : s));
 
-        // Add only the newest 1 episode to the active Queue so the Queue stays clean
         if (parsedEps.length > 0) {
           setEpisodes(prev => {
             const existingUrls = new Set(prev.map(e => e.audioUrl));
@@ -772,7 +760,6 @@ export default function App() {
     } catch (_) {}
   };
 
-  // Manual "Check for New Episodes" across all subscribed podcasts
   const checkNewEpisodesForSubscriptions = async () => {
     if (subscriptions.length === 0) {
       showToast('No subscribed podcasts yet. Add shows via Search or OPML!');
@@ -800,7 +787,6 @@ export default function App() {
             episodeCount: parsedEps.length
           } : s));
 
-          // Check the latest 2 episodes from each show to see if they are newly released
           for (const ep of parsedEps.slice(0, 2)) {
             if (!existingKeys.has(ep.audioUrl) && !existingKeys.has(ep.guid)) {
               existingKeys.add(ep.audioUrl);
@@ -830,7 +816,6 @@ export default function App() {
     }
   };
 
-  // OPML File Import Handler
   const handleOpmlFileSelect = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -1133,7 +1118,7 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
             <h1 className="font-bold text-base tracking-tight flex items-center gap-2">
               SkipCast
               <span className="text-[10px] font-semibold uppercase px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                v6 Native Media
+                v6.1 Native Media
               </span>
             </h1>
             <p className="text-xs text-slate-400">AI Ad-Skipping Podcast Player</p>
@@ -1146,7 +1131,6 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
         </div>
       </header>
 
-      {/* Navigation Tabs */}
       <div className="flex border-b border-slate-800 bg-slate-900/40 px-3 gap-1 pt-2 overflow-x-auto no-scrollbar">
         {[
           { id: 'player', label: 'Player' },
@@ -1195,7 +1179,6 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
       )}
 
       <main className="flex-1 p-4 max-w-3xl w-full mx-auto space-y-4">
-        {/* PLAYER TAB */}
         {activeTab === 'player' && currentEp && (
           <>
             <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
@@ -1427,7 +1410,7 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
                           <img
                             src={sub.artwork || DEFAULT_ARTWORK}
                             alt=""
-                            className="w-13 h-13 rounded-xl object-cover border border-slate-800 shrink-0"
+                            className="w-12 h-12 rounded-xl object-cover border border-slate-800 shrink-0"
                           />
                           <div className="min-w-0">
                             <div className="text-sm font-bold text-white truncate">{sub.title}</div>
@@ -1453,7 +1436,6 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
                 )}
               </>
             ) : (
-              /* INNER PODCAST SHOW EPISODE LIST (UP TO 60 EPISODES) */
               <div className="space-y-4">
                 <div className="flex items-center justify-between border-b border-slate-800 pb-3 gap-2">
                   <button
@@ -1488,7 +1470,6 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
                   </div>
                 </div>
 
-                {/* Filter within this show's 60 episodes */}
                 <input
                   type="text"
                   value={episodeFilterQuery}
@@ -1824,7 +1805,6 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
         )}
       </main>
 
-      {/* Bottom Sticky Player Bar */}
       <div className="fixed bottom-0 left-0 right-0 bg-slate-900/95 backdrop-blur border-t border-slate-800 p-3 z-30">
         <div className="max-w-3xl mx-auto space-y-2">
           <div
