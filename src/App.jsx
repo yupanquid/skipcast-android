@@ -3,8 +3,9 @@ import {
   Play, Pause, FastForward, Rewind, ShieldCheck, Zap, Scissors,
   Volume2, VolumeX, Sparkles, AlertTriangle, RefreshCw,
   Search, Download, CheckCircle2, Trash2, WifiOff, Rss,
-  Plus, Check, FolderUp, FileDown
+  Plus, Check, FolderUp, FileDown, ArrowLeft, ListPlus, ChevronRight
 } from 'lucide-react';
+import { MediaSession } from '@jofr/capacitor-media-session';
 
 const DEFAULT_ARTWORK = 'https://images.unsplash.com/photo-1590602847861-f357a9332bbc?w=512&q=80';
 
@@ -30,17 +31,21 @@ const INITIAL_EPISODES = [
   }
 ];
 
-// IndexedDB helper for storing full MP3 files offline on Android
-const DB_NAME = 'SkipCastOfflineDB';
-const STORE_NAME = 'audioFiles';
+// IndexedDB helper for storing full MP3 files AND 50+ episode show caches
+const DB_NAME = 'SkipCastOfflineDB_v6';
+const AUDIO_STORE = 'audioFiles';
+const FEED_CACHE_STORE = 'showEpisodesCache';
 
-const openAudioDB = () => {
+const openAppDB = () => {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1);
+    const req = indexedDB.open(DB_NAME, 2);
     req.onupgradeneeded = (e) => {
       const db = e.target.result;
-      if (!db.objectStoreNames.contains(STORE_NAME)) {
-        db.createObjectStore(STORE_NAME);
+      if (!db.objectStoreNames.contains(AUDIO_STORE)) {
+        db.createObjectStore(AUDIO_STORE);
+      }
+      if (!db.objectStoreNames.contains(FEED_CACHE_STORE)) {
+        db.createObjectStore(FEED_CACHE_STORE);
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -49,43 +54,69 @@ const openAudioDB = () => {
 };
 
 const saveEpisodeBlob = async (epId, blob) => {
-  const db = await openAudioDB();
+  const db = await openAppDB();
   return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, 'readwrite');
-    tx.objectStore(STORE_NAME).put(blob, epId);
+    const tx = db.transaction(AUDIO_STORE, 'readwrite');
+    tx.objectStore(AUDIO_STORE).put(blob, epId);
     tx.oncomplete = () => resolve(true);
     tx.onerror = () => reject(tx.error);
   });
 };
 
 const getEpisodeBlob = async (epId) => {
-  const db = await openAudioDB();
+  const db = await openAppDB();
   return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, 'readonly');
-    const req = tx.objectStore(STORE_NAME).get(epId);
+    const tx = db.transaction(AUDIO_STORE, 'readonly');
+    const req = tx.objectStore(AUDIO_STORE).get(epId);
     req.onsuccess = () => resolve(req.result || null);
     req.onerror = () => reject(req.error);
   });
 };
 
 const deleteEpisodeBlob = async (epId) => {
-  const db = await openAudioDB();
+  const db = await openAppDB();
   return new Promise((resolve, reject) => {
-    const tx = db.transaction(STORE_NAME, 'readwrite');
-    tx.objectStore(STORE_NAME).delete(epId);
+    const tx = db.transaction(AUDIO_STORE, 'readwrite');
+    tx.objectStore(AUDIO_STORE).delete(epId);
     tx.oncomplete = () => resolve(true);
     tx.onerror = () => reject(tx.error);
   });
 };
 
 const getAllOfflineKeys = async () => {
-  const db = await openAudioDB();
+  const db = await openAppDB();
   return new Promise((resolve) => {
-    const tx = db.transaction(STORE_NAME, 'readonly');
-    const req = tx.objectStore(STORE_NAME).getAllKeys();
+    const tx = db.transaction(AUDIO_STORE, 'readonly');
+    const req = tx.objectStore(AUDIO_STORE).getAllKeys();
     req.onsuccess = () => resolve(req.result || []);
     req.onerror = () => resolve([]);
   });
+};
+
+const saveShowArchiveCache = async (feedUrl, episodesArray) => {
+  try {
+    const db = await openAppDB();
+    return new Promise((resolve) => {
+      const tx = db.transaction(FEED_CACHE_STORE, 'readwrite');
+      tx.objectStore(FEED_CACHE_STORE).put(episodesArray, feedUrl.toLowerCase());
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => resolve(false);
+    });
+  } catch (_) {}
+};
+
+const getShowArchiveCache = async (feedUrl) => {
+  try {
+    const db = await openAppDB();
+    return new Promise((resolve) => {
+      const tx = db.transaction(FEED_CACHE_STORE, 'readonly');
+      const req = tx.objectStore(FEED_CACHE_STORE).get(feedUrl.toLowerCase());
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => resolve(null);
+    });
+  } catch (_) {
+    return null;
+  }
 };
 
 // Fetch RSS XML with fallback proxies for Android WebView CORS compatibility
@@ -98,18 +129,18 @@ const fetchFeedXmlText = async (feedUrl) => {
 
   if (!xmlText || (!xmlText.includes('<item') && !xmlText.includes('<entry'))) {
     try {
-      const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(feedUrl)}`;
+      const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(feedUrl)}`;
       const r2 = await fetch(proxyUrl);
-      const data = await r2.json();
-      xmlText = data.contents || '';
+      if (r2.ok) xmlText = await r2.text();
     } catch (_) {}
   }
 
   if (!xmlText || (!xmlText.includes('<item') && !xmlText.includes('<entry'))) {
     try {
-      const proxyUrl2 = `https://corsproxy.io/?${encodeURIComponent(feedUrl)}`;
+      const proxyUrl2 = `https://api.allorigins.win/get?url=${encodeURIComponent(feedUrl)}`;
       const r3 = await fetch(proxyUrl2);
-      if (r3.ok) xmlText = await r3.text();
+      const data = await r3.json();
+      xmlText = data.contents || '';
     } catch (_) {}
   }
 
@@ -119,7 +150,7 @@ const fetchFeedXmlText = async (feedUrl) => {
 export default function App() {
   const [episodes, setEpisodes] = useState(() => {
     try {
-      const saved = localStorage.getItem('skipcast_episodes_v5');
+      const saved = localStorage.getItem('skipcast_episodes_v6') || localStorage.getItem('skipcast_episodes_v5');
       if (saved) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed) && parsed.length > 0) return parsed;
@@ -143,6 +174,12 @@ export default function App() {
     return localStorage.getItem('skipcast_active_ep') || INITIAL_EPISODES[0].id;
   });
 
+  // Inner Podcast Show View State (displays 50-60 episodes per show)
+  const [selectedPodcast, setSelectedPodcast] = useState(null);
+  const [selectedPodcastEpisodes, setSelectedPodcastEpisodes] = useState([]);
+  const [isLoadingShowEps, setIsLoadingShowEps] = useState(false);
+  const [episodeFilterQuery, setEpisodeFilterQuery] = useState('');
+
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(1800);
@@ -160,17 +197,14 @@ export default function App() {
   const [scanStage, setScanStage] = useState('');
   const [activeTab, setActiveTab] = useState('player');
 
-  // Search & Directory state
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState([]);
   const [isSearching, setIsSearching] = useState(false);
 
-  // Subscription & OPML state
   const [isUpdatingFeeds, setIsUpdatingFeeds] = useState(false);
   const [feedUpdateProgress, setFeedUpdateProgress] = useState('');
   const [lastFeedCheck, setLastFeedCheck] = useState(() => localStorage.getItem('skipcast_last_check') || 'Never');
 
-  // Offline download state
   const [offlineIds, setOfflineIds] = useState([]);
   const [downloadingId, setDownloadingId] = useState(null);
   const [playingOfflineBlob, setPlayingOfflineBlob] = useState(false);
@@ -194,13 +228,12 @@ export default function App() {
 
   const showToast = (msg) => {
     setStatusToast(msg);
-    setTimeout(() => setStatusToast(null), 4000);
+    setTimeout(() => setStatusToast(null), 3800);
   };
 
-  // Persist episodes, subscriptions & stats automatically
   useEffect(() => {
     try {
-      localStorage.setItem('skipcast_episodes_v5', JSON.stringify(episodes));
+      localStorage.setItem('skipcast_episodes_v6', JSON.stringify(episodes));
     } catch (_) {}
   }, [episodes]);
 
@@ -268,83 +301,101 @@ export default function App() {
     return () => { isCancelled = true; };
   }, [currentEpId]);
 
-  // Android System MediaSession Metadata & Lock-Screen Controls
+  // NATIVE ANDROID + WEB MEDIASESSION BRIDGE (Quick Settings Tile, Lock Screen, Notification Shade)
   useEffect(() => {
-    if (!('mediaSession' in navigator) || !currentEp) return;
-
-    navigator.mediaSession.metadata = new window.MediaMetadata({
+    if (!currentEp) return;
+    const artUrl = currentEp.artwork || DEFAULT_ARTWORK;
+    const metaPayload = {
       title: currentEp.title || 'SkipCast Episode',
       artist: currentEp.podcast || 'SkipCast AI Player',
       album: autoSkip ? 'SkipCast • Auto-Skip ON' : 'SkipCast • Auto-Skip OFF',
       artwork: [
-        { src: currentEp.artwork || DEFAULT_ARTWORK, sizes: '512x512', type: 'image/jpeg' }
+        { src: artUrl, sizes: '512x512', type: 'image/jpeg' }
       ]
-    });
+    };
 
-    navigator.mediaSession.setActionHandler('play', async () => {
-      if (audioRef.current) {
-        try {
-          await audioRef.current.play();
-          setIsPlaying(true);
-        } catch (_) {}
-      }
-    });
+    // 1. Trigger Native Android Foreground Media Service Notification via Capacitor Plugin
+    const syncNativeMediaSession = async () => {
+      try {
+        await MediaSession.setMetadata(metaPayload);
 
-    navigator.mediaSession.setActionHandler('pause', () => {
-      if (audioRef.current) {
-        audioRef.current.pause();
-        setIsPlaying(false);
-      }
-    });
+        await MediaSession.setActionHandler({ action: 'play' }, async () => {
+          if (audioRef.current) {
+            await audioRef.current.play();
+            setIsPlaying(true);
+          }
+        });
 
-    navigator.mediaSession.setActionHandler('seekbackward', (details) => {
-      const offset = details.seekOffset || 15;
-      if (audioRef.current) {
-        const next = Math.max(0, audioRef.current.currentTime - offset);
-        audioRef.current.currentTime = next;
-        setCurrentTime(next);
-      }
-    });
+        await MediaSession.setActionHandler({ action: 'pause' }, () => {
+          if (audioRef.current) {
+            audioRef.current.pause();
+            setIsPlaying(false);
+          }
+        });
 
-    navigator.mediaSession.setActionHandler('seekforward', (details) => {
-      const offset = details.seekOffset || 30;
-      if (audioRef.current) {
-        const next = Math.min(duration || 3600, audioRef.current.currentTime + offset);
-        audioRef.current.currentTime = next;
-        setCurrentTime(next);
-      }
-    });
+        await MediaSession.setActionHandler({ action: 'seekbackward' }, (details) => {
+          const offset = details?.seekOffset || 15;
+          if (audioRef.current) {
+            const next = Math.max(0, audioRef.current.currentTime - offset);
+            audioRef.current.currentTime = next;
+            setCurrentTime(next);
+          }
+        });
 
-    navigator.mediaSession.setActionHandler('seekto', (details) => {
-      if (audioRef.current && details.seekTime != null) {
-        lastSkippedAdRef.current = null;
-        audioRef.current.currentTime = details.seekTime;
-        setCurrentTime(details.seekTime);
-      }
-    });
+        await MediaSession.setActionHandler({ action: 'seekforward' }, (details) => {
+          const offset = details?.seekOffset || 30;
+          if (audioRef.current) {
+            const next = Math.min(duration || 3600, audioRef.current.currentTime + offset);
+            audioRef.current.currentTime = next;
+            setCurrentTime(next);
+          }
+        });
 
-    navigator.mediaSession.setActionHandler('nexttrack', () => {
-      if (audioRef.current) {
-        const now = audioRef.current.currentTime;
-        const activeAd = currentEp.ads?.find(a => now >= a.startTime && now < a.endTime);
-        const target = activeAd ? activeAd.endTime : Math.min(duration || 3600, now + 30);
-        audioRef.current.currentTime = target;
-        setCurrentTime(target);
-      }
-    });
+        await MediaSession.setActionHandler({ action: 'seekto' }, (details) => {
+          if (audioRef.current && details?.seekTime != null) {
+            lastSkippedAdRef.current = null;
+            audioRef.current.currentTime = details.seekTime;
+            setCurrentTime(details.seekTime);
+          }
+        });
 
-    navigator.mediaSession.setActionHandler('previoustrack', () => {
-      if (audioRef.current) {
-        const next = Math.max(0, audioRef.current.currentTime - 15);
-        audioRef.current.currentTime = next;
-        setCurrentTime(next);
-      }
-    });
+        await MediaSession.setActionHandler({ action: 'nexttrack' }, () => {
+          if (audioRef.current) {
+            const now = audioRef.current.currentTime;
+            const activeAd = currentEp.ads?.find(a => now >= a.startTime && now < a.endTime);
+            const target = activeAd ? activeAd.endTime : Math.min(duration || 3600, now + 30);
+            audioRef.current.currentTime = target;
+            setCurrentTime(target);
+          }
+        });
+
+        await MediaSession.setActionHandler({ action: 'previoustrack' }, () => {
+          if (audioRef.current) {
+            const next = Math.max(0, audioRef.current.currentTime - 15);
+            audioRef.current.currentTime = next;
+            setCurrentTime(next);
+          }
+        });
+      } catch (_) {}
+    };
+    syncNativeMediaSession();
+
+    // 2. Also populate Web MediaSession as fallback
+    if ('mediaSession' in navigator) {
+      try {
+        navigator.mediaSession.metadata = new window.MediaMetadata(metaPayload);
+      } catch (_) {}
+    }
   }, [currentEp, autoSkip, duration]);
 
+  // Keep Native Android Notification PlaybackState synced
   useEffect(() => {
+    const stateStr = isPlaying ? 'playing' : 'paused';
+    try {
+      MediaSession.setPlaybackState({ playbackState: stateStr });
+    } catch (_) {}
     if ('mediaSession' in navigator) {
-      navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
+      navigator.mediaSession.playbackState = stateStr;
     }
   }, [isPlaying]);
 
@@ -375,13 +426,14 @@ export default function App() {
     const now = audio.currentTime;
     setCurrentTime(now);
 
-    if ('mediaSession' in navigator && 'setPositionState' in navigator.mediaSession) {
-      const validDur = audio.duration && isFinite(audio.duration) ? audio.duration : duration;
-      if (validDur > 0 && now <= validDur) {
+    const validDur = audio.duration && isFinite(audio.duration) ? audio.duration : duration;
+    if (validDur > 0 && now <= validDur) {
+      // Update Native Android Notification scrubber position every ~1 second
+      if (Math.floor(now) !== Math.floor(now - 0.25)) {
         try {
-          navigator.mediaSession.setPositionState({
+          MediaSession.setPositionState({
             duration: validDur,
-            playbackRate: audio.playbackRate || 1,
+            playbackRate: audio.playbackRate || 1.0,
             position: now
           });
         } catch (_) {}
@@ -451,6 +503,17 @@ export default function App() {
     return `${m}:${s < 10 ? '0' : ''}${s}`;
   };
 
+  const formatShortDate = (dateStr) => {
+    if (!dateStr) return '';
+    try {
+      const d = new Date(dateStr);
+      if (isNaN(d.getTime())) return '';
+      return d.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
+    } catch (_) {
+      return '';
+    }
+  };
+
   const handleTestSkip = async (ad) => {
     const target = Math.max(0, ad.startTime - 2);
     seekTo(target);
@@ -472,7 +535,6 @@ export default function App() {
     }));
   };
 
-  // Download or Remove Offline MP3 in IndexedDB
   const handleToggleOfflineDownload = async (ep, e) => {
     if (e) e.stopPropagation();
     if (offlineIds.includes(ep.id)) {
@@ -481,6 +543,12 @@ export default function App() {
       if (ep.id === currentEp.id) setPlayingOfflineBlob(false);
       return;
     }
+
+    // Ensure episode is in Queue when downloaded offline
+    setEpisodes(prev => {
+      if (prev.some(item => item.id === ep.id || item.audioUrl === ep.audioUrl)) return prev;
+      return [ep, ...prev];
+    });
 
     setDownloadingId(ep.id);
     setAudioError(null);
@@ -524,11 +592,12 @@ export default function App() {
     }
   };
 
-  // Parse RSS XML into episode objects + channel metadata
-  const parseFeedXml = (xmlText, feedUrl, fallbackArt, maxItems = 10) => {
+  // Parse up to 60 episodes per podcast RSS feed
+  const parseFeedXml = (xmlText, feedUrl, fallbackArt, maxItems = 60) => {
     const parser = new DOMParser();
     const xml = parser.parseFromString(xmlText, 'text/xml');
     const channelTitle = xml.querySelector('channel > title')?.textContent?.trim() || 'Subscribed Podcast';
+    const channelDesc = xml.querySelector('channel > description')?.textContent?.replace(/<[^>]+>/g, '')?.trim() || '';
     const channelArt =
       fallbackArt ||
       xml.querySelector('channel > image > url')?.textContent?.trim() ||
@@ -540,12 +609,27 @@ export default function App() {
       const epTitle = item.querySelector('title')?.textContent?.trim() || `Episode ${idx + 1}`;
       const enclosure = item.querySelector('enclosure')?.getAttribute('url') || '';
       const rawGuid = item.querySelector('guid')?.textContent?.trim() || enclosure || `${feedUrl}-${epTitle}`;
-      const pubDate = item.querySelector('pubDate')?.textContent || new Date().toISOString();
+      const pubDate = item.querySelector('pubDate')?.textContent || '';
       const desc = item.querySelector('description')?.textContent?.replace(/<[^>]+>/g, '') || '';
       const epArt = item.getElementsByTagName('itunes:image')?.[0]?.getAttribute('href') || channelArt;
 
+      // Parse iTunes duration tag if present (HH:MM:SS or seconds)
+      let parsedDur = 1800;
+      const durStr = item.getElementsByTagName('itunes:duration')?.[0]?.textContent?.trim();
+      if (durStr) {
+        if (durStr.includes(':')) {
+          const parts = durStr.split(':').map(Number);
+          if (parts.length === 3) parsedDur = parts[0] * 3600 + parts[1] * 60 + parts[2];
+          else if (parts.length === 2) parsedDur = parts[0] * 60 + parts[1];
+        } else if (!isNaN(Number(durStr))) {
+          parsedDur = Number(durStr);
+        }
+      }
+
+      const safeHash = btoa(unescape(encodeURIComponent(rawGuid))).replace(/[^a-zA-Z0-9]/g, '').slice(0, 22);
+
       return {
-        id: `ep-${ btoa(unescape(encodeURIComponent(rawGuid))).replace(/[^a-zA-Z0-9]/g, '').slice(0, 24) }-${idx}`,
+        id: `ep-${safeHash}-${idx}`,
         guid: rawGuid,
         feedUrl,
         title: epTitle,
@@ -553,31 +637,99 @@ export default function App() {
         audioUrl: enclosure,
         artwork: epArt,
         pubDate,
-        duration: 1800,
+        duration: parsedDur || 1800,
         scanned: false,
         ads: [],
         rawNotes: desc.slice(0, 1500),
         transcript: [
-          { start: 0, end: 60, text: desc ? desc.slice(0, 400) + '...' : 'Episode loaded from RSS feed. Press Play to stream or tap Download Offline.', isAd: false }
+          { start: 0, end: 60, text: desc ? desc.slice(0, 450) + '...' : 'Episode loaded from RSS feed. Press Play to stream or tap Download Offline.', isAd: false }
         ]
       };
     }).filter(ep => ep.audioUrl);
 
-    return { channelTitle, channelArt, parsedEps };
+    return { channelTitle, channelDesc, channelArt, parsedEps };
   };
 
-  // Subscribe or Unsubscribe to a podcast show
+  // Open Inner 60-Episode Browser for a Subscribed Show
+  const openPodcastShowView = async (sub, forceRefresh = false) => {
+    setSelectedPodcast(sub);
+    setEpisodeFilterQuery('');
+    setIsLoadingShowEps(true);
+
+    if (!forceRefresh) {
+      const cached = await getShowArchiveCache(sub.feedUrl);
+      if (cached && cached.length > 0) {
+        setSelectedPodcastEpisodes(cached);
+        setIsLoadingShowEps(false);
+        return;
+      }
+    }
+
+    try {
+      const xmlText = await fetchFeedXmlText(sub.feedUrl);
+      if (xmlText && xmlText.includes('<item')) {
+        const { channelTitle, channelArt, parsedEps } = parseFeedXml(xmlText, sub.feedUrl, sub.artwork, 60);
+        setSelectedPodcastEpisodes(parsedEps);
+        await saveShowArchiveCache(sub.feedUrl, parsedEps);
+
+        // Update show artwork & episode count in subscriptions list
+        setSubscriptions(prev => prev.map(s => s.id === sub.id ? {
+          ...s,
+          title: s.title === 'Subscribed Podcast' ? channelTitle : s.title,
+          artwork: s.artwork === DEFAULT_ARTWORK ? channelArt : s.artwork,
+          episodeCount: parsedEps.length
+        } : s));
+      } else {
+        setAudioError('Could not load episode list from this RSS feed.');
+      }
+    } catch (_) {
+      setAudioError('Error fetching podcast episodes.');
+    } finally {
+      setIsLoadingShowEps(false);
+    }
+  };
+
+  // Play an episode directly from the 60-episode Show View
+  const playEpisodeFromShow = (ep) => {
+    setEpisodes(prev => {
+      const exists = prev.find(item => item.audioUrl === ep.audioUrl || item.id === ep.id);
+      if (exists) {
+        setCurrentEpId(exists.id);
+        return prev;
+      }
+      setCurrentEpId(ep.id);
+      return [ep, ...prev];
+    });
+    setActiveTab('player');
+  };
+
+  // Add an episode from the Show View to Queue without interrupting current playback
+  const addEpisodeToQueue = (ep, e) => {
+    if (e) e.stopPropagation();
+    const alreadyInQueue = episodes.some(item => item.audioUrl === ep.audioUrl || item.id === ep.id);
+    if (alreadyInQueue) {
+      showToast('Episode is already in your Queue');
+      return;
+    }
+    setEpisodes(prev => [ep, ...prev]);
+    showToast('Added to Queue');
+  };
+
   const isSubscribed = (feedUrl) => {
     if (!feedUrl) return false;
     return subscriptions.some(s => s.feedUrl.toLowerCase() === feedUrl.toLowerCase());
   };
 
-  const toggleSubscription = async (showObj) => {
+  const toggleSubscription = async (showObj, e) => {
+    if (e) e.stopPropagation();
     const { feedUrl, title, author, artwork } = showObj;
     if (!feedUrl) return;
 
     if (isSubscribed(feedUrl)) {
       setSubscriptions(prev => prev.filter(s => s.feedUrl.toLowerCase() !== feedUrl.toLowerCase()));
+      if (selectedPodcast?.feedUrl?.toLowerCase() === feedUrl.toLowerCase()) {
+        setSelectedPodcast(null);
+      }
       showToast(`Unsubscribed from ${title}`);
       return;
     }
@@ -588,29 +740,32 @@ export default function App() {
       author: author || '',
       feedUrl,
       artwork: artwork || DEFAULT_ARTWORK,
+      episodeCount: 0,
       addedAt: new Date().toISOString()
     };
 
     setSubscriptions(prev => [newSub, ...prev]);
-    showToast(`Subscribed to ${newSub.title}! Fetching latest episodes...`);
+    showToast(`Subscribed to ${newSub.title}! Caching last 60 episodes...`);
 
-    // Automatically fetch the latest 5 episodes when subscribing
     try {
       const xmlText = await fetchFeedXmlText(feedUrl);
       if (xmlText && xmlText.includes('<item')) {
-        const { channelTitle, channelArt, parsedEps } = parseFeedXml(xmlText, feedUrl, artwork, 5);
-        // Update subscription title/artwork if originally generic
+        const { channelTitle, channelArt, parsedEps } = parseFeedXml(xmlText, feedUrl, artwork, 60);
+        await saveShowArchiveCache(feedUrl, parsedEps);
+
         setSubscriptions(prev => prev.map(s => s.id === newSub.id ? {
           ...s,
           title: s.title === 'Subscribed Podcast' ? channelTitle : s.title,
-          artwork: s.artwork === DEFAULT_ARTWORK ? channelArt : s.artwork
+          artwork: s.artwork === DEFAULT_ARTWORK ? channelArt : s.artwork,
+          episodeCount: parsedEps.length
         } : s));
 
+        // Add only the newest 1 episode to the active Queue so the Queue stays clean
         if (parsedEps.length > 0) {
           setEpisodes(prev => {
             const existingUrls = new Set(prev.map(e => e.audioUrl));
-            const fresh = parsedEps.filter(e => !existingUrls.has(e.audioUrl));
-            return [...fresh, ...prev];
+            const newest = parsedEps.slice(0, 1).filter(e => !existingUrls.has(e.audioUrl));
+            return [...newest, ...prev];
           });
         }
       }
@@ -618,9 +773,8 @@ export default function App() {
   };
 
   // Manual "Check for New Episodes" across all subscribed podcasts
-  const checkNewEpisodesForSubscriptions = async (targetSub = null) => {
-    const listToPoll = targetSub ? [targetSub] : subscriptions;
-    if (listToPoll.length === 0) {
+  const checkNewEpisodesForSubscriptions = async () => {
+    if (subscriptions.length === 0) {
       showToast('No subscribed podcasts yet. Add shows via Search or OPML!');
       return;
     }
@@ -630,20 +784,24 @@ export default function App() {
     const existingKeys = new Set(episodes.flatMap(e => [e.audioUrl, e.guid].filter(Boolean)));
     const allNewEpisodes = [];
 
-    for (let i = 0; i < listToPoll.length; i++) {
-      const sub = listToPoll[i];
-      setFeedUpdateProgress(`Checking (${i + 1}/${listToPoll.length}): ${sub.title}...`);
+    for (let i = 0; i < subscriptions.length; i++) {
+      const sub = subscriptions[i];
+      setFeedUpdateProgress(`Refreshing (${i + 1}/${subscriptions.length}): ${sub.title}...`);
       try {
         const xmlText = await fetchFeedXmlText(sub.feedUrl);
         if (xmlText && xmlText.includes('<item')) {
-          const { channelTitle, channelArt, parsedEps } = parseFeedXml(xmlText, sub.feedUrl, sub.artwork, targetSub ? 10 : 5);
+          const { channelTitle, channelArt, parsedEps } = parseFeedXml(xmlText, sub.feedUrl, sub.artwork, 60);
+          await saveShowArchiveCache(sub.feedUrl, parsedEps);
 
-          // Update artwork/title if missing from OPML import
-          if (sub.artwork === DEFAULT_ARTWORK && channelArt !== DEFAULT_ARTWORK) {
-            setSubscriptions(prev => prev.map(s => s.feedUrl === sub.feedUrl ? { ...s, artwork: channelArt, title: sub.title || channelTitle } : s));
-          }
+          setSubscriptions(prev => prev.map(s => s.feedUrl === sub.feedUrl ? {
+            ...s,
+            artwork: s.artwork === DEFAULT_ARTWORK ? channelArt : s.artwork,
+            title: s.title || channelTitle,
+            episodeCount: parsedEps.length
+          } : s));
 
-          for (const ep of parsedEps) {
+          // Check the latest 2 episodes from each show to see if they are newly released
+          for (const ep of parsedEps.slice(0, 2)) {
             if (!existingKeys.has(ep.audioUrl) && !existingKeys.has(ep.guid)) {
               existingKeys.add(ep.audioUrl);
               existingKeys.add(ep.guid);
@@ -666,13 +824,13 @@ export default function App() {
     setFeedUpdateProgress('');
 
     if (newAddedTotal > 0) {
-      showToast(`Found and added ${newAddedTotal} new episode${newAddedTotal > 1 ? 's' : ''} to your Queue!`);
+      showToast(`Refreshed 60-ep archives & added ${newAddedTotal} new episode${newAddedTotal > 1 ? 's' : ''} to Queue!`);
     } else {
-      showToast('All subscribed podcasts are up to date (0 new episodes).');
+      showToast('All podcast archives updated! No brand-new episodes since last check.');
     }
   };
 
-  // OPML File Import Handler (<outline xmlUrl="..." />)
+  // OPML File Import Handler
   const handleOpmlFileSelect = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -704,16 +862,18 @@ export default function App() {
         importedSubs.push({
           id: `opml-${Date.now()}-${idx}`,
           title: title.trim(),
-          author: 'Imported via OPML',
+          author: 'Tap to browse last 60 episodes',
           feedUrl,
           artwork: DEFAULT_ARTWORK,
+          episodeCount: 0,
           addedAt: new Date().toISOString()
         });
       });
 
       if (importedSubs.length > 0) {
         setSubscriptions(prev => [...importedSubs, ...prev]);
-        showToast(`Imported ${importedSubs.length} podcasts from OPML!`);
+        showToast(`Imported ${importedSubs.length} podcasts! Tap any show to browse its last 60 episodes.`);
+        setSelectedPodcast(null);
         setActiveTab('subscribed');
       } else {
         showToast(`All ${outlines.length} podcasts in that OPML file are already in your Subscribed list.`);
@@ -726,7 +886,6 @@ export default function App() {
     }
   };
 
-  // Export current subscriptions to a standard .opml file
   const handleExportOpml = () => {
     if (subscriptions.length === 0) {
       showToast('No subscriptions to export yet.');
@@ -764,7 +923,6 @@ ${outlinesXml}
     showToast('Exported skipcast-subscriptions.opml');
   };
 
-  // Search Apple Podcasts Directory by show name
   const handlePodcastSearch = async (e) => {
     e.preventDefault();
     if (!searchQuery.trim()) return;
@@ -781,55 +939,6 @@ ${outlinesXml}
     }
   };
 
-  // Load RSS episodes directly
-  const importRssUrl = async (feedUrl, fallbackArt, alsoSubscribe = false) => {
-    if (!feedUrl) return;
-    setIsImportingRss(true);
-    setImportStatus('Fetching Podcast RSS Feed XML...');
-    try {
-      const xmlText = await fetchFeedXmlText(feedUrl);
-      if (xmlText && xmlText.includes('<item')) {
-        const { channelTitle, channelArt, parsedEps } = parseFeedXml(xmlText, feedUrl, fallbackArt, 10);
-
-        if (alsoSubscribe && !isSubscribed(feedUrl)) {
-          setSubscriptions(prev => [
-            {
-              id: `sub-${Date.now()}`,
-              title: channelTitle,
-              author: 'RSS Feed',
-              feedUrl,
-              artwork: channelArt,
-              addedAt: new Date().toISOString()
-            },
-            ...prev
-          ]);
-        }
-
-        if (parsedEps.length > 0) {
-          setEpisodes(prev => {
-            const existingUrls = new Set(prev.map(e => e.audioUrl));
-            const uniqueNew = parsedEps.filter(e => !existingUrls.has(e.audioUrl));
-            return [...uniqueNew, ...prev];
-          });
-          setCurrentEpId(parsedEps[0].id);
-          setCustomAudioUrl('');
-          setCustomTitle('');
-          setImportStatus('');
-          showToast(`Loaded ${parsedEps.length} episodes from ${channelTitle}`);
-          setActiveTab('player');
-          return true;
-        }
-      }
-      setImportStatus('Could not find audio enclosures in feed.');
-      return false;
-    } catch (_) {
-      setImportStatus('Error parsing RSS feed.');
-      return false;
-    } finally {
-      setIsImportingRss(false);
-    }
-  };
-
   const handleManualImport = async (e) => {
     e.preventDefault();
     const url = customAudioUrl.trim();
@@ -837,7 +946,19 @@ ${outlinesXml}
 
     const isDirectAudio = /\.(mp3|m4a|aac|ogg|wav)(\?.*)?$/i.test(url);
     if (!isDirectAudio) {
-      await importRssUrl(url, null, true);
+      setIsImportingRss(true);
+      setImportStatus('Subscribing & fetching 60-episode archive...');
+      await toggleSubscription({
+        title: customTitle.trim() || 'Subscribed Podcast',
+        author: 'Custom RSS Feed',
+        feedUrl: url,
+        artwork: DEFAULT_ARTWORK
+      });
+      setIsImportingRss(false);
+      setImportStatus('');
+      setCustomAudioUrl('');
+      setCustomTitle('');
+      setActiveTab('subscribed');
       return;
     }
 
@@ -983,6 +1104,12 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
 
   const isCurrentOffline = offlineIds.includes(currentEp?.id);
 
+  const filteredShowEpisodes = selectedPodcastEpisodes.filter(ep =>
+    !episodeFilterQuery.trim() ||
+    ep.title.toLowerCase().includes(episodeFilterQuery.toLowerCase()) ||
+    (ep.rawNotes && ep.rawNotes.toLowerCase().includes(episodeFilterQuery.toLowerCase()))
+  );
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col pb-32">
       <audio
@@ -1006,7 +1133,7 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
             <h1 className="font-bold text-base tracking-tight flex items-center gap-2">
               SkipCast
               <span className="text-[10px] font-semibold uppercase px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                v5 OPML & Subs
+                v6 Native Media
               </span>
             </h1>
             <p className="text-xs text-slate-400">AI Ad-Skipping Podcast Player</p>
@@ -1235,97 +1362,205 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
           </>
         )}
 
-        {/* SUBSCRIBED TAB (WITH MANUAL FEED UPDATER) */}
+        {/* SUBSCRIBED TAB (WITH INNER 60-EPISODE ARCHIVE VIEW PER PODCAST) */}
         {activeTab === 'subscribed' && (
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-4">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-800 pb-3">
-              <div>
-                <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                  <Rss className="w-4 h-4 text-emerald-400" />
-                  Subscribed Podcasts ({subscriptions.length})
-                </h3>
-                <p className="text-[11px] text-slate-400 mt-0.5">
-                  Last checked for new episodes: <span className="text-slate-300 font-medium">{lastFeedCheck}</span>
-                </p>
-              </div>
+            {!selectedPodcast ? (
+              <>
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-800 pb-3">
+                  <div>
+                    <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                      <Rss className="w-4 h-4 text-emerald-400" />
+                      Subscribed Podcasts ({subscriptions.length})
+                    </h3>
+                    <p className="text-[11px] text-slate-400 mt-0.5">
+                      Tap any show to browse its last 60 episodes • Last checked: <span className="text-slate-300 font-medium">{lastFeedCheck}</span>
+                    </p>
+                  </div>
 
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => checkNewEpisodesForSubscriptions(null)}
-                  disabled={isUpdatingFeeds || subscriptions.length === 0}
-                  className="px-3.5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold text-xs flex items-center gap-1.5 shadow"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${isUpdatingFeeds ? 'animate-spin' : ''}`} />
-                  {isUpdatingFeeds ? 'Checking Feeds...' : 'Check for New Episodes'}
-                </button>
-              </div>
-            </div>
-
-            {isUpdatingFeeds && feedUpdateProgress && (
-              <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs flex items-center gap-2">
-                <RefreshCw className="w-4 h-4 animate-spin shrink-0" />
-                <span className="truncate">{feedUpdateProgress}</span>
-              </div>
-            )}
-
-            {subscriptions.length === 0 ? (
-              <div className="text-center py-8 space-y-3">
-                <p className="text-xs text-slate-400">
-                  You haven't subscribed to any podcasts yet.
-                </p>
-                <div className="flex flex-wrap justify-center gap-2">
                   <button
-                    onClick={() => setActiveTab('discover')}
-                    className="px-3.5 py-2 rounded-xl bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 text-xs font-semibold"
+                    onClick={checkNewEpisodesForSubscriptions}
+                    disabled={isUpdatingFeeds || subscriptions.length === 0}
+                    className="px-3.5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold text-xs flex items-center gap-1.5 shadow shrink-0"
                   >
-                    Search Shows to Subscribe
-                  </button>
-                  <button
-                    onClick={() => setActiveTab('import')}
-                    className="px-3.5 py-2 rounded-xl bg-slate-800 text-slate-200 border border-slate-700 text-xs font-semibold"
-                  >
-                    Import OPML File
+                    <RefreshCw className={`w-3.5 h-3.5 ${isUpdatingFeeds ? 'animate-spin' : ''}`} />
+                    {isUpdatingFeeds ? 'Checking Feeds...' : 'Check for New Episodes'}
                   </button>
                 </div>
-              </div>
-            ) : (
-              <div className="space-y-2.5">
-                {subscriptions.map(sub => (
-                  <div
-                    key={sub.id}
-                    className="p-3 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between gap-3"
-                  >
-                    <div className="flex items-center gap-3 min-w-0">
-                      <img
-                        src={sub.artwork || DEFAULT_ARTWORK}
-                        alt=""
-                        className="w-12 h-12 rounded-lg object-cover border border-slate-800 shrink-0"
-                      />
-                      <div className="min-w-0">
-                        <div className="text-sm font-bold text-white truncate">{sub.title}</div>
-                        <div className="text-[11px] text-slate-400 truncate">{sub.feedUrl}</div>
-                      </div>
-                    </div>
 
-                    <div className="flex items-center gap-1.5 shrink-0">
+                {isUpdatingFeeds && feedUpdateProgress && (
+                  <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs flex items-center gap-2">
+                    <RefreshCw className="w-4 h-4 animate-spin shrink-0" />
+                    <span className="truncate">{feedUpdateProgress}</span>
+                  </div>
+                )}
+
+                {subscriptions.length === 0 ? (
+                  <div className="text-center py-8 space-y-3">
+                    <p className="text-xs text-slate-400">
+                      You haven't subscribed to any podcasts yet.
+                    </p>
+                    <div className="flex flex-wrap justify-center gap-2">
                       <button
-                        onClick={() => checkNewEpisodesForSubscriptions(sub)}
-                        disabled={isUpdatingFeeds}
-                        className="px-2.5 py-1.5 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/30 text-xs font-semibold"
-                        title="Fetch latest episodes from this show"
+                        onClick={() => setActiveTab('discover')}
+                        className="px-3.5 py-2 rounded-xl bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 text-xs font-semibold"
                       >
-                        Fetch Latest
+                        Search Shows to Subscribe
                       </button>
                       <button
-                        onClick={() => toggleSubscription(sub)}
-                        className="p-2 rounded-lg bg-slate-800 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300"
-                        title="Unsubscribe"
+                        onClick={() => setActiveTab('import')}
+                        className="px-3.5 py-2 rounded-xl bg-slate-800 text-slate-200 border border-slate-700 text-xs font-semibold"
                       >
-                        <Trash2 className="w-4 h-4" />
+                        Import OPML File
                       </button>
                     </div>
                   </div>
-                ))}
+                ) : (
+                  <div className="space-y-2.5">
+                    {subscriptions.map(sub => (
+                      <div
+                        key={sub.id}
+                        onClick={() => openPodcastShowView(sub, false)}
+                        className="p-3 rounded-xl bg-slate-950 hover:bg-slate-900 border border-slate-800 cursor-pointer flex items-center justify-between gap-3 transition"
+                      >
+                        <div className="flex items-center gap-3 min-w-0">
+                          <img
+                            src={sub.artwork || DEFAULT_ARTWORK}
+                            alt=""
+                            className="w-13 h-13 rounded-xl object-cover border border-slate-800 shrink-0"
+                          />
+                          <div className="min-w-0">
+                            <div className="text-sm font-bold text-white truncate">{sub.title}</div>
+                            <div className="text-[11px] text-emerald-400 font-medium mt-0.5">
+                              {sub.episodeCount ? `${sub.episodeCount} episodes cached • Tap to open` : 'Tap to load last 60 episodes'}
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-2 shrink-0">
+                          <button
+                            onClick={(e) => toggleSubscription(sub, e)}
+                            className="p-2 rounded-lg bg-slate-800/80 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300"
+                            title="Unsubscribe"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                          <ChevronRight className="w-4 h-4 text-slate-400" />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
+            ) : (
+              /* INNER PODCAST SHOW EPISODE LIST (UP TO 60 EPISODES) */
+              <div className="space-y-4">
+                <div className="flex items-center justify-between border-b border-slate-800 pb-3 gap-2">
+                  <button
+                    onClick={() => setSelectedPodcast(null)}
+                    className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1.5"
+                  >
+                    <ArrowLeft className="w-4 h-4" />
+                    Back to Subscribed
+                  </button>
+
+                  <button
+                    onClick={() => openPodcastShowView(selectedPodcast, true)}
+                    disabled={isLoadingShowEps}
+                    className="px-3 py-1.5 rounded-xl bg-emerald-500/20 border border-emerald-500/30 text-emerald-300 text-xs font-semibold flex items-center gap-1.5"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${isLoadingShowEps ? 'animate-spin' : ''}`} />
+                    Refresh Feed
+                  </button>
+                </div>
+
+                <div className="flex items-center gap-3">
+                  <img
+                    src={selectedPodcast.artwork || DEFAULT_ARTWORK}
+                    alt=""
+                    className="w-16 h-16 rounded-xl object-cover border border-slate-700 shrink-0"
+                  />
+                  <div className="min-w-0">
+                    <h3 className="text-base font-bold text-white leading-snug">{selectedPodcast.title}</h3>
+                    <p className="text-xs text-emerald-400 mt-0.5">
+                      Showing {selectedPodcastEpisodes.length} episodes from RSS feed
+                    </p>
+                  </div>
+                </div>
+
+                {/* Filter within this show's 60 episodes */}
+                <input
+                  type="text"
+                  value={episodeFilterQuery}
+                  onChange={e => setEpisodeFilterQuery(e.target.value)}
+                  placeholder="Filter episodes in this podcast..."
+                  className="w-full bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white"
+                />
+
+                {isLoadingShowEps ? (
+                  <div className="py-12 text-center space-y-2">
+                    <RefreshCw className="w-6 h-6 animate-spin text-emerald-400 mx-auto" />
+                    <p className="text-xs text-slate-400">Fetching up to 60 episodes from RSS feed...</p>
+                  </div>
+                ) : (
+                  <div className="space-y-2.5 max-h-[62vh] overflow-y-auto pr-1">
+                    {filteredShowEpisodes.map((ep, idx) => {
+                      const isSaved = offlineIds.includes(ep.id);
+                      const isPlayingThis = currentEp?.audioUrl === ep.audioUrl;
+                      return (
+                        <div
+                          key={ep.id}
+                          onClick={() => playEpisodeFromShow(ep)}
+                          className={`p-3 rounded-xl border cursor-pointer flex items-center justify-between gap-3 transition ${
+                            isPlayingThis
+                              ? 'bg-emerald-500/15 border-emerald-500/40'
+                              : 'bg-slate-950 hover:bg-slate-900 border-slate-800'
+                          }`}
+                        >
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-2 text-[10px] text-slate-400 font-mono">
+                              <span>#{idx + 1}</span>
+                              {ep.pubDate && <span>• {formatShortDate(ep.pubDate)}</span>}
+                              {ep.duration > 0 && <span>• {formatTime(ep.duration)}</span>}
+                              {isSaved && <span className="text-emerald-400 font-semibold">• Offline</span>}
+                            </div>
+                            <div className="text-xs font-bold text-white mt-0.5 line-clamp-2">{ep.title}</div>
+                            {ep.rawNotes && (
+                              <p className="text-[11px] text-slate-400 line-clamp-1 mt-1">{ep.rawNotes}</p>
+                            )}
+                          </div>
+
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            <button
+                              onClick={(e) => addEpisodeToQueue(ep, e)}
+                              className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300"
+                              title="Add to Queue"
+                            >
+                              <ListPlus className="w-4 h-4" />
+                            </button>
+                            <button
+                              onClick={(e) => handleToggleOfflineDownload(ep, e)}
+                              className={`p-2 rounded-lg border ${
+                                isSaved
+                                  ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300'
+                                  : 'bg-slate-800 border-slate-700 text-slate-300'
+                              }`}
+                              title="Download Offline"
+                            >
+                              {downloadingId === ep.id ? (
+                                <RefreshCw className="w-4 h-4 animate-spin" />
+                              ) : isSaved ? (
+                                <CheckCircle2 className="w-4 h-4" />
+                              ) : (
+                                <Download className="w-4 h-4" />
+                              )}
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             )}
           </div>
@@ -1337,7 +1572,7 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
             <div>
               <h3 className="text-sm font-bold text-white">Search Podcast Directory</h3>
               <p className="text-xs text-slate-400 mt-0.5">
-                Search for any podcast to subscribe or load its latest episodes directly into your queue.
+                Search for any podcast to subscribe and browse its last 60 episodes.
               </p>
             </div>
 
@@ -1358,13 +1593,6 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
                 {isSearching ? 'Searching...' : 'Search'}
               </button>
             </form>
-
-            {isImportingRss && (
-              <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs flex items-center gap-2">
-                <RefreshCw className="w-4 h-4 animate-spin" />
-                {importStatus || 'Loading episodes from podcast RSS feed...'}
-              </div>
-            )}
 
             <div className="space-y-2.5">
               {searchResults.map(pod => {
@@ -1387,30 +1615,23 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
                     </div>
                     <div className="flex items-center gap-1.5 shrink-0">
                       <button
-                        onClick={() =>
+                        onClick={(e) =>
                           toggleSubscription({
                             title: pod.collectionName,
                             author: pod.artistName,
                             feedUrl: pod.feedUrl,
                             artwork: pod.artworkUrl600 || pod.artworkUrl100
-                          })
+                          }, e)
                         }
                         disabled={!pod.feedUrl}
-                        className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1 border ${
+                        className={`px-3 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1 border ${
                           subbed
                             ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300'
-                            : 'bg-slate-800 border-slate-700 text-slate-200 hover:bg-slate-700'
+                            : 'bg-emerald-500 text-slate-950 border-emerald-400 font-bold'
                         }`}
                       >
                         {subbed ? <Check className="w-3.5 h-3.5" /> : <Plus className="w-3.5 h-3.5" />}
                         {subbed ? 'Subscribed' : 'Subscribe'}
-                      </button>
-                      <button
-                        onClick={() => importRssUrl(pod.feedUrl, pod.artworkUrl600 || pod.artworkUrl100, false)}
-                        disabled={isImportingRss || !pod.feedUrl}
-                        className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-emerald-400 text-xs font-semibold"
-                      >
-                        Load 10 Eps
                       </button>
                     </div>
                   </div>
@@ -1424,7 +1645,7 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
         {activeTab === 'episodes' && (
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
             <div className="flex items-center justify-between">
-              <h3 className="text-sm font-bold text-white">Saved Queue ({episodes.length})</h3>
+              <h3 className="text-sm font-bold text-white">Active Playback Queue ({episodes.length})</h3>
               <span className="text-[11px] text-slate-400">
                 {offlineIds.length} downloaded offline
               </span>
@@ -1497,24 +1718,21 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
         {/* IMPORT OPML / RSS / DIRECT STREAM TAB */}
         {activeTab === 'import' && (
           <div className="space-y-4">
-            {/* OPML Batch Importer & Exporter Card */}
             <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
-              <div className="flex items-center justify-between">
-                <div>
-                  <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                    <FolderUp className="w-4 h-4 text-emerald-400" />
-                    OPML Subscription Import & Backup
-                  </h3>
-                  <p className="text-xs text-slate-400 mt-0.5">
-                    Import your entire subscribed podcast list from AntennaPod, Pocket Casts, Overcast, or any app that exports an `.opml` or `.xml` file.
-                  </p>
-                </div>
+              <div>
+                <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                  <FolderUp className="w-4 h-4 text-emerald-400" />
+                  OPML Subscription Import & Backup
+                </h3>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  Import your entire subscribed podcast list from AntennaPod, Pocket Casts, or any `.opml` / `.xml` export.
+                </p>
               </div>
 
               <input
                 ref={opmlInputRef}
                 type="file"
-                accept=".opml,.xml,text/xml,application/xml"
+                accept=".opml,.xml,text/xml,application/xml,*/*"
                 onChange={handleOpmlFileSelect}
                 className="hidden"
               />
@@ -1535,12 +1753,11 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
                   className="px-3.5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-semibold text-xs flex items-center gap-2"
                 >
                   <FileDown className="w-4 h-4 text-emerald-400" />
-                  Export My Subscriptions (.OPML)
+                  Export Subscriptions (.OPML)
                 </button>
               </div>
             </div>
 
-            {/* Single RSS / MP3 URL Form */}
             <form onSubmit={handleManualImport} className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
               <h3 className="text-sm font-bold text-white">Add Single Podcast RSS URL or Direct MP3</h3>
               <div>
@@ -1570,7 +1787,7 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
                 disabled={isImportingRss}
                 className="w-full py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-emerald-500/40 text-emerald-300 font-bold text-xs"
               >
-                {isImportingRss ? 'Fetching & Subscribing...' : 'Subscribe & Load Episodes'}
+                {isImportingRss ? 'Subscribing...' : 'Subscribe & Cache 60 Episodes'}
               </button>
             </form>
           </div>
