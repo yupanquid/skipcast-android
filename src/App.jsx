@@ -1,8 +1,11 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
   Play, Pause, FastForward, Rewind, ShieldCheck, Zap, Scissors,
-  Volume2, VolumeX, Radio, Sparkles, AlertTriangle, ChevronRight, RefreshCw
+  Volume2, VolumeX, Sparkles, AlertTriangle, ChevronRight, RefreshCw,
+  Search, Download, CheckCircle2, Trash2, WifiOff
 } from 'lucide-react';
+
+const DEFAULT_ARTWORK = 'https://images.unsplash.com/photo-1590602847861-f357a9332bbc?w=512&q=80';
 
 const INITIAL_EPISODES = [
   {
@@ -10,42 +13,123 @@ const INITIAL_EPISODES = [
     title: 'SomaFM: Deep Space One (Live Ambient Stream Test)',
     podcast: 'Live Audio Stream Verification',
     audioUrl: 'https://ice1.somafm.com/deepspaceone-128-mp3',
+    artwork: 'https://somafm.com/img3/deepspaceone-400.jpg',
     duration: 3600,
     scanned: true,
     ads: [
       { id: 'ad-demo-1', startTime: 15, endTime: 35, sponsor: 'Test Ad Window (15s-35s)', category: 'Dynamic Pre-Roll', confidence: 0.98, reason: 'Tap "Test Skip" to hear real audio jump over this 20s block', whitelisted: false }
     ],
     transcript: [
-      { start: 0, end: 15, text: "Live MP3 stream connected. Press Play below to verify hardware audio output.", isAd: false },
+      { start: 0, end: 15, text: "Live MP3 stream connected. Press Play below to verify hardware audio output and Lock Screen Media Tile.", isAd: false },
       { start: 15, end: 35, text: "[TEST SPONSOR BLOCK] Auto-Skip will jump from 0:15 directly to 0:35 during playback.", isAd: true, adId: 'ad-demo-1' },
       { start: 35, end: 3600, text: "Clean audio stream continues.", isAd: false }
     ]
   }
 ];
 
+// IndexedDB helper for storing full MP3 files offline on Android
+const DB_NAME = 'SkipCastOfflineDB';
+const STORE_NAME = 'audioFiles';
+
+const openAudioDB = () => {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+};
+
+const saveEpisodeBlob = async (epId, blob) => {
+  const db = await openAudioDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    tx.objectStore(STORE_NAME).put(blob, epId);
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error);
+  });
+};
+
+const getEpisodeBlob = async (epId) => {
+  const db = await openAudioDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readonly');
+    const req = tx.objectStore(STORE_NAME).get(epId);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+};
+
+const deleteEpisodeBlob = async (epId) => {
+  const db = await openAudioDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    tx.objectStore(STORE_NAME).delete(epId);
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error);
+  });
+};
+
+const getAllOfflineKeys = async () => {
+  const db = await openAudioDB();
+  return new Promise((resolve) => {
+    const tx = db.transaction(STORE_NAME, 'readonly');
+    const req = tx.objectStore(STORE_NAME).getAllKeys();
+    req.onsuccess = () => resolve(req.result || []);
+    req.onerror = () => resolve([]);
+  });
+};
+
 export default function App() {
-  const [episodes, setEpisodes] = useState(INITIAL_EPISODES);
-  const [currentEpId, setCurrentEpId] = useState(INITIAL_EPISODES[0].id);
+  const [episodes, setEpisodes] = useState(() => {
+    try {
+      const saved = localStorage.getItem('skipcast_episodes_v4');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch (_) {}
+    return INITIAL_EPISODES;
+  });
+
+  const [currentEpId, setCurrentEpId] = useState(() => {
+    return localStorage.getItem('skipcast_active_ep') || INITIAL_EPISODES[0].id;
+  });
+
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
-  const [duration, setDuration] = useState(INITIAL_EPISODES[0].duration);
+  const [duration, setDuration] = useState(1800);
   const [isMuted, setIsMuted] = useState(false);
   const [audioError, setAudioError] = useState(null);
 
   const [autoSkip, setAutoSkip] = useState(true);
   const [playChime, setPlayChime] = useState(true);
-  const [adsSkippedCount, setAdsSkippedCount] = useState(0);
-  const [timeSavedSec, setTimeSavedSec] = useState(0);
+  const [adsSkippedCount, setAdsSkippedCount] = useState(() => Number(localStorage.getItem('skipcast_skipped_count')) || 0);
+  const [timeSavedSec, setTimeSavedSec] = useState(() => Number(localStorage.getItem('skipcast_saved_sec')) || 0);
   const [skipBanner, setSkipBanner] = useState(null);
 
   const [isScanning, setIsScanning] = useState(false);
   const [scanStage, setScanStage] = useState('');
   const [activeTab, setActiveTab] = useState('player');
 
+  // Search & Directory state
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState([]);
+  const [isSearching, setIsSearching] = useState(false);
+
+  // Offline download state
+  const [offlineIds, setOfflineIds] = useState([]);
+  const [downloadingId, setDownloadingId] = useState(null);
+  const [playingOfflineBlob, setPlayingOfflineBlob] = useState(false);
+
   const [apiKey, setApiKey] = useState(() => localStorage.getItem('skipcast_gemini_key') || '');
   const [customAudioUrl, setCustomAudioUrl] = useState('');
   const [customTitle, setCustomTitle] = useState('');
-  const [customTranscriptText, setCustomTranscriptText] = useState('');
   const [isImportingRss, setIsImportingRss] = useState(false);
   const [importStatus, setImportStatus] = useState('');
 
@@ -55,25 +139,155 @@ export default function App() {
   const audioRef = useRef(null);
   const audioCtxRef = useRef(null);
   const lastSkippedAdRef = useRef(null);
+  const activeBlobUrlRef = useRef(null);
 
   const currentEp = episodes.find(e => e.id === currentEpId) || episodes[0];
+
+  // Persist episodes & stats automatically
+  useEffect(() => {
+    try {
+      localStorage.setItem('skipcast_episodes_v4', JSON.stringify(episodes));
+    } catch (_) {}
+  }, [episodes]);
+
+  useEffect(() => {
+    localStorage.setItem('skipcast_active_ep', currentEpId);
+  }, [currentEpId]);
+
+  useEffect(() => {
+    localStorage.setItem('skipcast_skipped_count', String(adsSkippedCount));
+    localStorage.setItem('skipcast_saved_sec', String(timeSavedSec));
+  }, [adsSkippedCount, timeSavedSec]);
 
   useEffect(() => {
     localStorage.setItem('skipcast_gemini_key', apiKey);
   }, [apiKey]);
 
-  // Load new episode into real HTML5 Audio element when selection changes
+  // Load list of offline cached episode IDs on boot
   useEffect(() => {
-    if (!audioRef.current) return;
-    setAudioError(null);
-    audioRef.current.pause();
-    audioRef.current.src = currentEp.audioUrl || '';
-    audioRef.current.load();
-    setCurrentTime(0);
-    setDuration(currentEp.duration || 0);
-    setIsPlaying(false);
-    lastSkippedAdRef.current = null;
+    getAllOfflineKeys().then(keys => setOfflineIds(keys));
+  }, []);
+
+  // Load new episode into HTML5 Audio (preferring offline IndexedDB blob if downloaded)
+  useEffect(() => {
+    let isCancelled = false;
+    const loadAudioSource = async () => {
+      if (!audioRef.current || !currentEp) return;
+      setAudioError(null);
+      audioRef.current.pause();
+      setIsPlaying(false);
+      setCurrentTime(0);
+      setDuration(currentEp.duration || 1800);
+      lastSkippedAdRef.current = null;
+
+      if (activeBlobUrlRef.current) {
+        URL.revokeObjectURL(activeBlobUrlRef.current);
+        activeBlobUrlRef.current = null;
+      }
+
+      try {
+        const offlineBlob = await getEpisodeBlob(currentEp.id);
+        if (!isCancelled && offlineBlob) {
+          const blobUrl = URL.createObjectURL(offlineBlob);
+          activeBlobUrlRef.current = blobUrl;
+          audioRef.current.src = blobUrl;
+          setPlayingOfflineBlob(true);
+        } else if (!isCancelled) {
+          audioRef.current.src = currentEp.audioUrl || '';
+          setPlayingOfflineBlob(false);
+        }
+        if (!isCancelled) audioRef.current.load();
+      } catch (_) {
+        if (!isCancelled) {
+          audioRef.current.src = currentEp.audioUrl || '';
+          setPlayingOfflineBlob(false);
+          audioRef.current.load();
+        }
+      }
+    };
+    loadAudioSource();
+    return () => { isCancelled = true; };
   }, [currentEpId]);
+
+  // Android System MediaSession Metadata & Lock-Screen Controls
+  useEffect(() => {
+    if (!('mediaSession' in navigator) || !currentEp) return;
+
+    navigator.mediaSession.metadata = new window.MediaMetadata({
+      title: currentEp.title || 'SkipCast Episode',
+      artist: currentEp.podcast || 'SkipCast AI Player',
+      album: autoSkip ? 'SkipCast • Auto-Skip ON' : 'SkipCast • Auto-Skip OFF',
+      artwork: [
+        { src: currentEp.artwork || DEFAULT_ARTWORK, sizes: '512x512', type: 'image/jpeg' }
+      ]
+    });
+
+    navigator.mediaSession.setActionHandler('play', async () => {
+      if (audioRef.current) {
+        try {
+          await audioRef.current.play();
+          setIsPlaying(true);
+        } catch (_) {}
+      }
+    });
+
+    navigator.mediaSession.setActionHandler('pause', () => {
+      if (audioRef.current) {
+        audioRef.current.pause();
+        setIsPlaying(false);
+      }
+    });
+
+    navigator.mediaSession.setActionHandler('seekbackward', (details) => {
+      const offset = details.seekOffset || 15;
+      if (audioRef.current) {
+        const next = Math.max(0, audioRef.current.currentTime - offset);
+        audioRef.current.currentTime = next;
+        setCurrentTime(next);
+      }
+    });
+
+    navigator.mediaSession.setActionHandler('seekforward', (details) => {
+      const offset = details.seekOffset || 30;
+      if (audioRef.current) {
+        const next = Math.min(duration || 3600, audioRef.current.currentTime + offset);
+        audioRef.current.currentTime = next;
+        setCurrentTime(next);
+      }
+    });
+
+    navigator.mediaSession.setActionHandler('seekto', (details) => {
+      if (audioRef.current && details.seekTime != null) {
+        lastSkippedAdRef.current = null;
+        audioRef.current.currentTime = details.seekTime;
+        setCurrentTime(details.seekTime);
+      }
+    });
+
+    navigator.mediaSession.setActionHandler('nexttrack', () => {
+      if (audioRef.current) {
+        const now = audioRef.current.currentTime;
+        const activeAd = currentEp.ads?.find(a => now >= a.startTime && now < a.endTime);
+        const target = activeAd ? activeAd.endTime : Math.min(duration || 3600, now + 30);
+        audioRef.current.currentTime = target;
+        setCurrentTime(target);
+      }
+    });
+
+    navigator.mediaSession.setActionHandler('previoustrack', () => {
+      if (audioRef.current) {
+        const next = Math.max(0, audioRef.current.currentTime - 15);
+        audioRef.current.currentTime = next;
+        setCurrentTime(next);
+      }
+    });
+  }, [currentEp, autoSkip, duration]);
+
+  useEffect(() => {
+    if ('mediaSession' in navigator) {
+      navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
+    }
+  }, [isPlaying]);
 
   const triggerSkipChime = () => {
     if (!playChime) return;
@@ -93,17 +307,27 @@ export default function App() {
       gain.connect(ctx.destination);
       osc.start();
       osc.stop(ctx.currentTime + 0.18);
-    } catch (e) {
-      // Ignore WebAudio context restrictions
-    }
+    } catch (_) {}
   };
 
-  // Real-time playhead listener & automatic ad-skipper
   const handleTimeUpdate = () => {
     const audio = audioRef.current;
     if (!audio) return;
     const now = audio.currentTime;
     setCurrentTime(now);
+
+    if ('mediaSession' in navigator && 'setPositionState' in navigator.mediaSession) {
+      const validDur = audio.duration && isFinite(audio.duration) ? audio.duration : duration;
+      if (validDur > 0 && now <= validDur) {
+        try {
+          navigator.mediaSession.setPositionState({
+            duration: validDur,
+            playbackRate: audio.playbackRate || 1,
+            position: now
+          });
+        } catch (_) {}
+      }
+    }
 
     if (autoSkip && currentEp.scanned && currentEp.ads?.length > 0) {
       const hitAd = currentEp.ads.find(
@@ -145,7 +369,7 @@ export default function App() {
         await audio.play();
         setIsPlaying(true);
       } catch (err) {
-        setAudioError('Playback failed: Check that the URL is a valid MP3/AAC stream.');
+        setAudioError('Playback failed: Verify stream URL or download episode for offline playback.');
         setIsPlaying(false);
       }
     }
@@ -155,9 +379,7 @@ export default function App() {
     const audio = audioRef.current;
     const clamped = Math.max(0, Math.min(duration || 3600, newTime));
     lastSkippedAdRef.current = null;
-    if (audio) {
-      audio.currentTime = clamped;
-    }
+    if (audio) audio.currentTime = clamped;
     setCurrentTime(clamped);
   };
 
@@ -166,9 +388,7 @@ export default function App() {
     const hrs = Math.floor(sec / 3600);
     const m = Math.floor((sec % 3600) / 60);
     const s = Math.floor(sec % 60);
-    if (hrs > 0) {
-      return `${hrs}:${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
-    }
+    if (hrs > 0) return `${hrs}:${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
     return `${m}:${s < 10 ? '0' : ''}${s}`;
   };
 
@@ -179,7 +399,7 @@ export default function App() {
       try {
         await audioRef.current.play();
         setIsPlaying(true);
-      } catch (e) {}
+      } catch (_) {}
     }
   };
 
@@ -193,18 +413,189 @@ export default function App() {
     }));
   };
 
-  // Run AI + Heuristic Ad Detection based on real episode duration & metadata
+  // Download or Remove Offline MP3 in IndexedDB
+  const handleToggleOfflineDownload = async (ep, e) => {
+    if (e) e.stopPropagation();
+    if (offlineIds.includes(ep.id)) {
+      await deleteEpisodeBlob(ep.id);
+      setOfflineIds(prev => prev.filter(id => id !== ep.id));
+      if (ep.id === currentEp.id) setPlayingOfflineBlob(false);
+      return;
+    }
+
+    setDownloadingId(ep.id);
+    setAudioError(null);
+    try {
+      let resp;
+      try {
+        resp = await fetch(ep.audioUrl);
+      } catch (_) {
+        // Fallback to CORS proxy if podcast host blocks direct fetch
+        resp = await fetch(`https://corsproxy.io/?${encodeURIComponent(ep.audioUrl)}`);
+      }
+      if (!resp || !resp.ok) throw new Error('Download failed');
+      const blob = await resp.blob();
+      await saveEpisodeBlob(ep.id, blob);
+      const updatedKeys = await getAllOfflineKeys();
+      setOfflineIds(updatedKeys);
+
+      if (ep.id === currentEp.id && audioRef.current) {
+        const blobUrl = URL.createObjectURL(blob);
+        activeBlobUrlRef.current = blobUrl;
+        const wasTime = audioRef.current.currentTime;
+        audioRef.current.src = blobUrl;
+        audioRef.current.currentTime = wasTime;
+        setPlayingOfflineBlob(true);
+      }
+    } catch (err) {
+      setAudioError('Offline download blocked by host CORS policy. Streaming playback still works.');
+    } finally {
+      setDownloadingId(null);
+    }
+  };
+
+  const deleteEpisodeFromQueue = (epId, e) => {
+    if (e) e.stopPropagation();
+    if (episodes.length <= 1) return;
+    deleteEpisodeBlob(epId).catch(() => {});
+    const remaining = episodes.filter(ep => ep.id !== epId);
+    setEpisodes(remaining);
+    if (currentEpId === epId) {
+      setCurrentEpId(remaining[0].id);
+    }
+  };
+
+  // Search Apple Podcasts Directory by show name
+  const handlePodcastSearch = async (e) => {
+    e.preventDefault();
+    if (!searchQuery.trim()) return;
+    setIsSearching(true);
+    setSearchResults([]);
+    try {
+      const res = await fetch(`https://itunes.apple.com/search?media=podcast&entity=podcast&limit=12&term=${encodeURIComponent(searchQuery.trim())}`);
+      const data = await res.json();
+      setSearchResults(data.results || []);
+    } catch (_) {
+      setAudioError('Directory search failed. Check your internet connection.');
+    } finally {
+      setIsSearching(false);
+    }
+  };
+
+  // Shared RSS XML Parser
+  const importRssUrl = async (feedUrl, fallbackArt) => {
+    if (!feedUrl) return;
+    setIsImportingRss(true);
+    setImportStatus('Fetching Podcast RSS Feed XML...');
+    try {
+      let xmlText = '';
+      try {
+        const r = await fetch(feedUrl);
+        if (r.ok) xmlText = await r.text();
+      } catch (_) {}
+
+      if (!xmlText || !xmlText.includes('<item>')) {
+        const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(feedUrl)}`;
+        const r2 = await fetch(proxyUrl);
+        const data = await r2.json();
+        xmlText = data.contents || '';
+      }
+
+      if (xmlText && xmlText.includes('<item>')) {
+        const parser = new DOMParser();
+        const xml = parser.parseFromString(xmlText, 'text/xml');
+        const channelTitle = xml.querySelector('channel > title')?.textContent || 'Subscribed Podcast';
+        const channelArt =
+          fallbackArt ||
+          xml.querySelector('channel > image > url')?.textContent ||
+          xml.getElementsByTagName('itunes:image')?.[0]?.getAttribute('href') ||
+          DEFAULT_ARTWORK;
+        const items = Array.from(xml.querySelectorAll('item')).slice(0, 10);
+
+        const parsedEps = items.map((item, idx) => {
+          const epTitle = item.querySelector('title')?.textContent || `Episode ${idx + 1}`;
+          const enclosure = item.querySelector('enclosure')?.getAttribute('url') || '';
+          const desc = item.querySelector('description')?.textContent?.replace(/<[^>]+>/g, '') || '';
+          const epArt = item.getElementsByTagName('itunes:image')?.[0]?.getAttribute('href') || channelArt;
+          return {
+            id: `rss-${Date.now()}-${idx}`,
+            title: epTitle,
+            podcast: channelTitle,
+            audioUrl: enclosure,
+            artwork: epArt,
+            duration: 1800,
+            scanned: false,
+            ads: [],
+            rawNotes: desc.slice(0, 1500),
+            transcript: [
+              { start: 0, end: 60, text: desc ? desc.slice(0, 400) + '...' : 'Episode loaded from RSS feed. Press Play to stream or tap Download Offline.', isAd: false }
+            ]
+          };
+        }).filter(ep => ep.audioUrl);
+
+        if (parsedEps.length > 0) {
+          setEpisodes(prev => [...parsedEps, ...prev]);
+          setCurrentEpId(parsedEps[0].id);
+          setCustomAudioUrl('');
+          setCustomTitle('');
+          setImportStatus('');
+          setActiveTab('player');
+          return true;
+        }
+      }
+      setImportStatus('Could not find audio enclosures in feed.');
+      return false;
+    } catch (_) {
+      setImportStatus('Error parsing RSS feed.');
+      return false;
+    } finally {
+      setIsImportingRss(false);
+    }
+  };
+
+  const handleManualImport = async (e) => {
+    e.preventDefault();
+    const url = customAudioUrl.trim();
+    if (!url) return;
+
+    const isDirectAudio = /\.(mp3|m4a|aac|ogg|wav)(\?.*)?$/i.test(url);
+    if (!isDirectAudio) {
+      await importRssUrl(url);
+      return;
+    }
+
+    const newId = `ep-${Date.now()}`;
+    const newEp = {
+      id: newId,
+      title: customTitle.trim() || 'Direct Audio Stream',
+      podcast: 'Custom Stream Import',
+      audioUrl: url,
+      artwork: DEFAULT_ARTWORK,
+      duration: 1800,
+      scanned: false,
+      ads: [],
+      rawNotes: '',
+      transcript: [
+        { start: 0, end: 30, text: 'Direct audio stream initialized. Press Play below to load full duration.', isAd: false }
+      ]
+    };
+    setEpisodes(prev => [newEp, ...prev]);
+    setCurrentEpId(newId);
+    setCustomTitle('');
+    setCustomAudioUrl('');
+    setActiveTab('player');
+  };
+
   const runAiAdScan = async () => {
     setIsScanning(true);
     const epDur = duration > 60 ? duration : (currentEp.duration || 1800);
 
     try {
       setScanStage('1/3 Inspecting audio duration & dynamic insertion boundaries...');
-      await new Promise(r => setTimeout(r, 700));
+      await new Promise(r => setTimeout(r, 600));
 
       let detectedAds = [];
 
-      // If user supplied a Gemini API Key, run live LLM classification on episode description/transcript
       if (apiKey.trim()) {
         setScanStage('2/3 Querying Gemini 2.5 Flash for sponsor timestamps...');
         const prompt = `Analyze this podcast episode (Total duration: ${Math.round(epDur)} seconds, Title: "${currentEp.title}", Notes/Transcript: "${currentEp.rawNotes || ''}").
@@ -240,10 +631,9 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
         }
       } else {
         setScanStage('2/3 Calculating Dynamic Ad Insertion (DAI) windows...');
-        await new Promise(r => setTimeout(r, 700));
+        await new Promise(r => setTimeout(r, 600));
       }
 
-      // Fallback heuristic DAI boundaries scaled to real episode length
       if (detectedAds.length === 0) {
         const preRollEnd = Math.min(35, Math.round(epDur * 0.04));
         const midRollStart = Math.round(epDur * 0.48);
@@ -275,26 +665,21 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
         }
       }
 
-      setScanStage('3/3 Applying skip markers to audio scrubber...');
-      await new Promise(r => setTimeout(r, 400));
+      setScanStage('3/3 Saving skip markers to offline storage...');
+      await new Promise(r => setTimeout(r, 300));
 
       setEpisodes(prev => prev.map(ep => {
         if (ep.id !== currentEp.id) return ep;
-        return {
-          ...ep,
-          scanned: true,
-          ads: detectedAds
-        };
+        return { ...ep, scanned: true, ads: detectedAds };
       }));
-    } catch (e) {
-      setAudioError('Scan warning: Used standard DAI rules.');
+    } catch (_) {
+      setAudioError('Scan completed with standard DAI rules.');
     } finally {
       setIsScanning(false);
       setScanStage('');
     }
   };
 
-  // Add manual ad range
   const handleAddManualAd = (e) => {
     e.preventDefault();
     const s = Number(manualStart);
@@ -318,114 +703,22 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
     setManualEnd('');
   };
 
-  // Import either a direct MP3 URL or parse a full Podcast RSS XML feed
-  const handleImport = async (e) => {
-    e.preventDefault();
-    const url = customAudioUrl.trim();
-    if (!url) return;
-
-    setIsImportingRss(true);
-    setImportStatus('Checking URL format...');
-
-    try {
-      const isDirectAudio = /\.(mp3|m4a|aac|ogg|wav)(\?.*)?$/i.test(url);
-
-      if (!isDirectAudio) {
-        setImportStatus('Fetching Podcast RSS Feed XML...');
-        // Try direct fetch first, fallback to AllOrigins CORS proxy for browser/WebView compatibility
-        let xmlText = '';
-        try {
-          const r = await fetch(url);
-          if (r.ok) xmlText = await r.text();
-        } catch (_) {}
-
-        if (!xmlText || !xmlText.includes('<item>')) {
-          const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
-          const r2 = await fetch(proxyUrl);
-          const data = await r2.json();
-          xmlText = data.contents || '';
-        }
-
-        if (xmlText && xmlText.includes('<item>')) {
-          const parser = new DOMParser();
-          const xml = parser.parseFromString(xmlText, 'text/xml');
-          const channelTitle = xml.querySelector('channel > title')?.textContent || 'Imported RSS Podcast';
-          const items = Array.from(xml.querySelectorAll('item')).slice(0, 8);
-
-          const parsedEps = items.map((item, idx) => {
-            const epTitle = item.querySelector('title')?.textContent || `Episode ${idx + 1}`;
-            const enclosure = item.querySelector('enclosure')?.getAttribute('url') || '';
-            const desc = item.querySelector('description')?.textContent?.replace(/<[^>]+>/g, '') || '';
-            return {
-              id: `rss-${Date.now()}-${idx}`,
-              title: epTitle,
-              podcast: channelTitle,
-              audioUrl: enclosure,
-              duration: 1800, // Will auto-update to exact second when HTML5 audio metadata loads
-              scanned: false,
-              ads: [],
-              rawNotes: desc.slice(0, 1500),
-              transcript: [
-                { start: 0, end: 60, text: desc ? desc.slice(0, 350) + '...' : 'Real audio loaded from RSS enclosure. Press Play to stream.', isAd: false }
-              ]
-            };
-          }).filter(ep => ep.audioUrl);
-
-          if (parsedEps.length > 0) {
-            setEpisodes(prev => [...parsedEps, ...prev]);
-            setCurrentEpId(parsedEps[0].id);
-            setCustomAudioUrl('');
-            setCustomTitle('');
-            setIsImportingRss(false);
-            setImportStatus('');
-            setActiveTab('player');
-            return;
-          }
-        }
-      }
-
-      // Direct MP3 / Audio Stream import
-      const newId = `ep-${Date.now()}`;
-      const newEp = {
-        id: newId,
-        title: customTitle.trim() || 'Imported Audio Stream',
-        podcast: 'Direct MP3 / Stream Import',
-        audioUrl: url,
-        duration: 1800, // Updates automatically via onLoadedMetadata when stream connects
-        scanned: false,
-        ads: [],
-        rawNotes: customTranscriptText,
-        transcript: [
-          { start: 0, end: 30, text: customTranscriptText || 'Direct audio stream initialized. Press Play below to load full duration and start playback.', isAd: false }
-        ]
-      };
-      setEpisodes(prev => [newEp, ...prev]);
-      setCurrentEpId(newId);
-      setCustomTitle('');
-      setCustomAudioUrl('');
-      setCustomTranscriptText('');
-      setActiveTab('player');
-    } catch (err) {
-      setImportStatus('Could not parse RSS feed. Make sure it is a valid RSS XML or direct MP3 URL.');
-    } finally {
-      setIsImportingRss(false);
-    }
-  };
+  const isCurrentOffline = offlineIds.includes(currentEp?.id);
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col pb-32">
-      {/* Hidden Hardware HTML5 Audio Element */}
       <audio
         ref={audioRef}
         onTimeUpdate={handleTimeUpdate}
         onLoadedMetadata={handleLoadedMetadata}
         onDurationChange={handleLoadedMetadata}
+        onPlay={() => setIsPlaying(true)}
+        onPause={() => setIsPlaying(false)}
         onEnded={() => setIsPlaying(false)}
-        onError={() => setAudioError('Unable to stream this audio URL. Verify the link is a direct MP3/AAC file.')}
+        onError={() => setAudioError('Stream error: Check connection or use Download Offline.')}
         preload="metadata"
       />
 
-      {/* Top Header */}
       <header className="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-20 px-4 py-3 flex items-center justify-between">
         <div className="flex items-center gap-2.5">
           <div className="w-9 h-9 rounded-xl bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-emerald-400">
@@ -435,7 +728,7 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
             <h1 className="font-bold text-base tracking-tight flex items-center gap-2">
               SkipCast
               <span className="text-[10px] font-semibold uppercase px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                v2 Real Audio
+                v4 Offline + Search
               </span>
             </h1>
             <p className="text-xs text-slate-400">AI Ad-Skipping Podcast Player</p>
@@ -449,23 +742,22 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
       </header>
 
       {/* Navigation Tabs */}
-      <div className="flex border-b border-slate-800 bg-slate-900/40 px-4 gap-2 pt-2">
-        {['player', 'episodes', 'import', 'settings'].map(tab => (
+      <div className="flex border-b border-slate-800 bg-slate-900/40 px-4 gap-1 pt-2 overflow-x-auto">
+        {['player', 'discover', 'episodes', 'import', 'settings'].map(tab => (
           <button
             key={tab}
             onClick={() => setActiveTab(tab)}
-            className={`px-3 py-2 text-xs font-semibold capitalize border-b-2 transition-colors ${
+            className={`px-3 py-2 text-xs font-semibold capitalize border-b-2 whitespace-nowrap transition-colors ${
               activeTab === tab
                 ? 'border-emerald-400 text-emerald-400'
                 : 'border-transparent text-slate-400 hover:text-slate-200'
             }`}
           >
-            {tab}
+            {tab === 'discover' ? 'Search Shows' : tab === 'episodes' ? `Queue (${episodes.length})` : tab}
           </button>
         ))}
       </div>
 
-      {/* Skip Notification Toast */}
       {skipBanner && (
         <div className="mx-4 mt-3 bg-emerald-500/20 border border-emerald-500/40 text-emerald-200 px-3.5 py-2.5 rounded-xl flex items-center justify-between text-xs font-medium animate-pulse">
           <span className="flex items-center gap-2">
@@ -482,30 +774,65 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
         </div>
       )}
 
-      {/* Main Content */}
       <main className="flex-1 p-4 max-w-3xl w-full mx-auto space-y-4">
-        {activeTab === 'player' && (
+        {activeTab === 'player' && currentEp && (
           <>
             <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
-              <div className="flex items-start justify-between gap-2">
-                <div>
-                  <span className="text-xs font-medium text-emerald-400">{currentEp.podcast}</span>
-                  <h2 className="text-base font-bold text-white leading-snug mt-0.5">{currentEp.title}</h2>
-                  <p className="text-[11px] text-slate-400 mt-1 break-all line-clamp-1">
-                    Stream: {currentEp.audioUrl}
-                  </p>
+              <div className="flex items-start gap-3">
+                <img
+                  src={currentEp.artwork || DEFAULT_ARTWORK}
+                  alt=""
+                  className="w-16 h-16 rounded-xl object-cover border border-slate-700 shrink-0"
+                />
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-medium text-emerald-400 truncate">{currentEp.podcast}</span>
+                    {playingOfflineBlob && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 flex items-center gap-1 shrink-0">
+                        <WifiOff className="w-3 h-3" /> Offline Ready
+                      </span>
+                    )}
+                  </div>
+                  <h2 className="text-sm font-bold text-white leading-snug mt-0.5">{currentEp.title}</h2>
+
+                  <div className="flex flex-wrap items-center gap-2 mt-2">
+                    <button
+                      onClick={() => setAutoSkip(!autoSkip)}
+                      className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold flex items-center gap-1 border ${
+                        autoSkip
+                          ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300'
+                          : 'bg-slate-800 border-slate-700 text-slate-400'
+                      }`}
+                    >
+                      <ShieldCheck className="w-3.5 h-3.5" />
+                      {autoSkip ? 'Auto-Skip ON' : 'Auto-Skip OFF'}
+                    </button>
+
+                    <button
+                      onClick={(e) => handleToggleOfflineDownload(currentEp, e)}
+                      disabled={downloadingId === currentEp.id}
+                      className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold flex items-center gap-1 border ${
+                        isCurrentOffline
+                          ? 'bg-slate-800 border-emerald-500/40 text-emerald-300'
+                          : 'bg-slate-800 border-slate-700 text-slate-200 hover:bg-slate-700'
+                      }`}
+                    >
+                      {downloadingId === currentEp.id ? (
+                        <>
+                          <RefreshCw className="w-3 h-3 animate-spin" /> Saving MP3...
+                        </>
+                      ) : isCurrentOffline ? (
+                        <>
+                          <CheckCircle2 className="w-3 h-3 text-emerald-400" /> Saved Offline (Tap to Remove)
+                        </>
+                      ) : (
+                        <>
+                          <Download className="w-3 h-3" /> Download Offline
+                        </>
+                      )}
+                    </button>
+                  </div>
                 </div>
-                <button
-                  onClick={() => setAutoSkip(!autoSkip)}
-                  className={`px-2.5 py-1 rounded-lg text-xs font-semibold flex items-center gap-1.5 shrink-0 border ${
-                    autoSkip
-                      ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300'
-                      : 'bg-slate-800 border-slate-700 text-slate-400'
-                  }`}
-                >
-                  <ShieldCheck className="w-3.5 h-3.5" />
-                  {autoSkip ? 'Auto-Skip ON' : 'Auto-Skip OFF'}
-                </button>
               </div>
 
               {!currentEp.scanned ? (
@@ -535,15 +862,12 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
               ) : (
                 <div className="space-y-2">
                   <div className="text-xs font-semibold text-slate-400 flex items-center justify-between">
-                    <span>Detected Ad Segments ({currentEp.ads.length})</span>
-                    <button
-                      onClick={runAiAdScan}
-                      className="text-[11px] text-emerald-400 underline"
-                    >
+                    <span>Detected Ad Segments ({currentEp.ads?.length || 0})</span>
+                    <button onClick={runAiAdScan} className="text-[11px] text-emerald-400 underline">
                       Re-Scan
                     </button>
                   </div>
-                  {currentEp.ads.map(ad => (
+                  {currentEp.ads?.map(ad => (
                     <div
                       key={ad.id}
                       className="bg-slate-950/80 border border-slate-800 rounded-xl p-2.5 flex items-center justify-between gap-2"
@@ -576,7 +900,6 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
                 </div>
               )}
 
-              {/* Quick Manual Skip Marker Input */}
               <form onSubmit={handleAddManualAd} className="pt-2 border-t border-slate-800/80 flex items-center gap-2">
                 <input
                   type="number"
@@ -601,16 +924,15 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
               </form>
             </div>
 
-            {/* Episode Notes / Transcript */}
             <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-2">
               <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                Episode Notes & Segments
+                Episode Show Notes
               </h3>
               {currentEp.transcript?.map((seg, idx) => (
                 <div
                   key={idx}
                   onClick={() => seekTo(seg.start)}
-                  className="p-2.5 rounded-xl border bg-slate-950/60 border-slate-800/80 text-xs text-slate-300 cursor-pointer"
+                  className="p-2.5 rounded-xl border bg-slate-950/60 border-slate-800/80 text-xs text-slate-300 cursor-pointer leading-relaxed"
                 >
                   {seg.text}
                 </div>
@@ -619,54 +941,161 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
           </>
         )}
 
+        {/* DISCOVER / DIRECTORY SEARCH TAB */}
+        {activeTab === 'discover' && (
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-4">
+            <div>
+              <h3 className="text-sm font-bold text-white">Search Podcast Directory</h3>
+              <p className="text-xs text-slate-400 mt-0.5">
+                Find any podcast by title or topic and load its latest episodes directly into your queue.
+              </p>
+            </div>
+
+            <form onSubmit={handlePodcastSearch} className="flex gap-2">
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={e => setSearchQuery(e.target.value)}
+                placeholder="Search e.g. Cults, Darknet Diaries, Comedy..."
+                className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white"
+              />
+              <button
+                type="submit"
+                disabled={isSearching}
+                className="px-4 py-2 rounded-xl bg-emerald-500 text-slate-950 font-bold text-xs flex items-center gap-1.5 shrink-0"
+              >
+                <Search className="w-4 h-4" />
+                {isSearching ? 'Searching...' : 'Search'}
+              </button>
+            </form>
+
+            {isImportingRss && (
+              <div className="p-3 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs flex items-center gap-2">
+                <RefreshCw className="w-4 h-4 animate-spin" />
+                {importStatus || 'Loading episodes from podcast RSS feed...'}
+              </div>
+            )}
+
+            <div className="space-y-2.5">
+              {searchResults.map(pod => (
+                <div
+                  key={pod.collectionId}
+                  className="p-3 rounded-xl bg-slate-950 border border-slate-800 flex items-center justify-between gap-3"
+                >
+                  <div className="flex items-center gap-3 min-w-0">
+                    <img
+                      src={pod.artworkUrl600 || pod.artworkUrl100 || DEFAULT_ARTWORK}
+                      alt=""
+                      className="w-12 h-12 rounded-lg object-cover shrink-0"
+                    />
+                    <div className="min-w-0">
+                      <div className="text-sm font-bold text-white truncate">{pod.collectionName}</div>
+                      <div className="text-xs text-slate-400 truncate">{pod.artistName}</div>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => importRssUrl(pod.feedUrl, pod.artworkUrl600 || pod.artworkUrl100)}
+                    disabled={isImportingRss || !pod.feedUrl}
+                    className="px-3 py-1.5 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/30 text-xs font-semibold shrink-0"
+                  >
+                    Load Episodes
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* EPISODE QUEUE & OFFLINE MANAGER TAB */}
         {activeTab === 'episodes' && (
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
-            <h3 className="text-sm font-bold text-white">Podcast Queue ({episodes.length})</h3>
-            {episodes.map(ep => (
-              <div
-                key={ep.id}
-                onClick={() => {
-                  setCurrentEpId(ep.id);
-                  setActiveTab('player');
-                }}
-                className={`p-3 rounded-xl border cursor-pointer flex items-center justify-between ${
-                  ep.id === currentEp.id
-                    ? 'bg-emerald-500/10 border-emerald-500/40'
-                    : 'bg-slate-950 border-slate-800'
-                }`}
-              >
-                <div className="min-w-0 pr-2">
-                  <div className="text-xs text-emerald-400 font-medium truncate">{ep.podcast}</div>
-                  <div className="text-sm font-semibold text-white truncate">{ep.title}</div>
-                  <div className="text-[11px] text-slate-400 mt-0.5">
-                    {ep.scanned ? `${ep.ads.length} ad windows active` : 'Tap to load & scan'}
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-bold text-white">Saved Queue ({episodes.length})</h3>
+              <span className="text-[11px] text-slate-400">
+                {offlineIds.length} downloaded offline
+              </span>
+            </div>
+            {episodes.map(ep => {
+              const isSaved = offlineIds.includes(ep.id);
+              return (
+                <div
+                  key={ep.id}
+                  onClick={() => {
+                    setCurrentEpId(ep.id);
+                    setActiveTab('player');
+                  }}
+                  className={`p-3 rounded-xl border cursor-pointer flex items-center justify-between gap-2 ${
+                    ep.id === currentEp?.id
+                      ? 'bg-emerald-500/10 border-emerald-500/40'
+                      : 'bg-slate-950 border-slate-800'
+                  }`}
+                >
+                  <div className="flex items-center gap-3 min-w-0">
+                    <img
+                      src={ep.artwork || DEFAULT_ARTWORK}
+                      alt=""
+                      className="w-11 h-11 rounded-lg object-cover shrink-0"
+                    />
+                    <div className="min-w-0">
+                      <div className="text-xs text-emerald-400 font-medium truncate">{ep.podcast}</div>
+                      <div className="text-sm font-semibold text-white truncate">{ep.title}</div>
+                      <div className="text-[11px] text-slate-400 mt-0.5 flex items-center gap-2">
+                        <span>{ep.scanned ? `${ep.ads?.length || 0} ads flagged` : 'Tap to scan'}</span>
+                        {isSaved && <span className="text-emerald-400 font-semibold">• Offline MP3</span>}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <button
+                      onClick={(e) => handleToggleOfflineDownload(ep, e)}
+                      className={`p-2 rounded-lg border ${
+                        isSaved
+                          ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300'
+                          : 'bg-slate-800 border-slate-700 text-slate-300'
+                      }`}
+                      title={isSaved ? 'Remove offline download' : 'Download MP3 for offline use'}
+                    >
+                      {downloadingId === ep.id ? (
+                        <RefreshCw className="w-4 h-4 animate-spin" />
+                      ) : isSaved ? (
+                        <CheckCircle2 className="w-4 h-4" />
+                      ) : (
+                        <Download className="w-4 h-4" />
+                      )}
+                    </button>
+                    {episodes.length > 1 && (
+                      <button
+                        onClick={(e) => deleteEpisodeFromQueue(ep.id, e)}
+                        className="p-2 rounded-lg bg-slate-800/80 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300"
+                        title="Remove from queue"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    )}
                   </div>
                 </div>
-                <ChevronRight className="w-4 h-4 text-slate-400 shrink-0" />
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
 
         {activeTab === 'import' && (
-          <form onSubmit={handleImport} className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
-            <h3 className="text-sm font-bold text-white">Import Podcast RSS Feed or Direct MP3</h3>
-            <p className="text-xs text-slate-400">
-              Paste any public Podcast RSS XML URL (loads the latest 8 full-length episodes automatically) or a direct `.mp3` stream link.
-            </p>
+          <form onSubmit={handleManualImport} className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
+            <h3 className="text-sm font-bold text-white">Import Direct URL or Custom RSS</h3>
             <div>
-              <label className="block text-xs text-slate-400 mb-1">Podcast RSS Feed URL or Direct MP3 URL *</label>
+              <label className="block text-xs text-slate-400 mb-1">Podcast RSS URL or Direct MP3 Stream *</label>
               <input
                 type="url"
                 required
                 value={customAudioUrl}
                 onChange={e => setCustomAudioUrl(e.target.value)}
-                placeholder="https://feeds.simplecast.com/... or https://.../episode.mp3"
+                placeholder="https://feeds.simplecast.com/... or https://.../stream.mp3"
                 className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white"
               />
             </div>
             <div>
-              <label className="block text-xs text-slate-400 mb-1">Custom Title (Optional for direct MP3s)</label>
+              <label className="block text-xs text-slate-400 mb-1">Custom Title (Optional)</label>
               <input
                 type="text"
                 value={customTitle}
@@ -675,15 +1104,13 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
                 className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white"
               />
             </div>
-            {importStatus && (
-              <div className="text-xs text-emerald-400 font-medium">{importStatus}</div>
-            )}
+            {importStatus && <div className="text-xs text-emerald-400 font-medium">{importStatus}</div>}
             <button
               type="submit"
               disabled={isImportingRss}
               className="w-full py-2.5 rounded-xl bg-emerald-500 text-slate-950 font-bold text-xs"
             >
-              {isImportingRss ? 'Fetching & Parsing Feed...' : 'Import Full Episodes'}
+              {isImportingRss ? 'Fetching & Parsing Feed...' : 'Import to Queue'}
             </button>
           </form>
         )}
@@ -705,7 +1132,7 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
             </div>
             <div>
               <label className="block text-xs text-slate-400 mb-1">
-                Gemini API Key (Optional — enables LLM show-notes & transcript ad detection)
+                Gemini API Key (Optional — enables LLM show-notes ad detection)
               </label>
               <input
                 type="password"
@@ -719,7 +1146,7 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
         )}
       </main>
 
-      {/* Bottom Sticky Hardware Player Bar */}
+      {/* Bottom Sticky Player Bar */}
       <div className="fixed bottom-0 left-0 right-0 bg-slate-900/95 backdrop-blur border-t border-slate-800 p-3 z-30">
         <div className="max-w-3xl mx-auto space-y-2">
           <div
@@ -734,7 +1161,7 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
               className="absolute top-0 left-0 bottom-0 bg-emerald-500 transition-all"
               style={{ width: `${Math.min(100, (currentTime / (duration || 1)) * 100)}%` }}
             />
-            {currentEp.scanned &&
+            {currentEp?.scanned &&
               currentEp.ads?.map(ad => (
                 <div
                   key={ad.id}
@@ -752,10 +1179,7 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
           <div className="flex items-center justify-between text-xs">
             <span className="font-mono text-slate-400">{formatTime(currentTime)}</span>
             <div className="flex items-center gap-4">
-              <button
-                onClick={() => seekTo(currentTime - 15)}
-                className="p-1.5 text-slate-300 hover:text-white"
-              >
+              <button onClick={() => seekTo(currentTime - 15)} className="p-1.5 text-slate-300 hover:text-white">
                 <Rewind className="w-4 h-4" />
               </button>
               <button
@@ -764,10 +1188,7 @@ If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad In
               >
                 {isPlaying ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5 ml-0.5" />}
               </button>
-              <button
-                onClick={() => seekTo(currentTime + 30)}
-                className="p-1.5 text-slate-300 hover:text-white"
-              >
+              <button onClick={() => seekTo(currentTime + 30)} className="p-1.5 text-slate-300 hover:text-white">
                 <FastForward className="w-4 h-4" />
               </button>
               <button
