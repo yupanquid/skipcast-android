@@ -1,71 +1,79 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
   Play, Pause, FastForward, Rewind, ShieldCheck, Zap, Scissors,
-  Volume2, VolumeX, Upload, Radio, Sparkles, CheckCircle2,
-  AlertTriangle, Settings, Clock, Sliders, ChevronRight, RefreshCw
+  Volume2, VolumeX, Radio, Sparkles, AlertTriangle, ChevronRight, RefreshCw
 } from 'lucide-react';
 
 const INITIAL_EPISODES = [
   {
-    id: 'ep-1',
-    title: 'Ep. 42: Inside Neural Audio Codecs & Low-Latency Streaming',
-    podcast: 'The Systems Stack',
-    duration: 180,
+    id: 'ep-real-1',
+    title: 'SomaFM: Deep Space One (Live Ambient Stream Test)',
+    podcast: 'Live Audio Stream Verification',
+    audioUrl: 'https://ice1.somafm.com/deepspaceone-128-mp3',
+    duration: 3600,
     scanned: true,
     ads: [
-      { id: 'ad-1', startTime: 18, endTime: 44, sponsor: 'CloudScale DB', category: 'Dynamic Pre-Roll', confidence: 0.98, reason: 'Abrupt acoustic shift + promo code "STACK20"', whitelisted: false },
-      { id: 'ad-2', startTime: 95, endTime: 132, sponsor: 'DevShield VPN', category: 'Host-Read Sponsor', confidence: 0.94, reason: 'Sponsor transition phrase "brought to you by" + call-to-action URL', whitelisted: false }
+      { id: 'ad-demo-1', startTime: 15, endTime: 35, sponsor: 'Test Ad Window (15s-35s)', category: 'Dynamic Pre-Roll', confidence: 0.98, reason: 'Tap "Test Skip" to hear real audio jump over this 20s block', whitelisted: false }
     ],
     transcript: [
-      { start: 0, end: 18, text: "Welcome back to The Systems Stack! Today we are breaking down ultra-low-latency audio codecs and how modern edge networks handle packet loss.", isAd: false },
-      { start: 18, end: 44, text: "[SPONSOR] Before we dive in, this episode is sponsored by CloudScale DB. Spin up serverless Postgres in 300 milliseconds. Visit cloudscale.io and use code STACK20 for $100 in free credit!", isAd: true, adId: 'ad-1' },
-      { start: 44, end: 95, text: "Now, looking at standard Opus encoding versus newer neural compression models, the primary trade-off happens right at the 16kbps threshold where human speech harmonics degrade.", isAd: false },
-      { start: 95, end: 132, text: "[SPONSOR] Speaking of security on public networks, let's talk about our friends at DevShield VPN. Whether you're pushing production code from a coffee shop or traveling, go to devshield.com/stack for 40% off.", isAd: true, adId: 'ad-2' },
-      { start: 132, end: 180, text: "Wrapping up our benchmark comparison: when you combine client-side playhead lookahead with frame-level indexing, you get seamless playback every single time. Thanks for listening!", isAd: false }
-    ]
-  },
-  {
-    id: 'ep-2',
-    title: 'Ep. 19: The Architecture of Distributed Databases',
-    podcast: 'Kernel Panic Weekly',
-    duration: 160,
-    scanned: false,
-    ads: [],
-    unscannedAdsPayload: [
-      { id: 'ad-201', startTime: 25, endTime: 58, sponsor: 'MetricsPulse APM', category: 'Host-Read Sponsor', confidence: 0.96, reason: 'Detected pricing pitch & vanity URL metricspulse.dev/kernel', whitelisted: false },
-      { id: 'ad-202', startTime: 110, endTime: 138, sponsor: 'HireTopDevs', category: 'Promo Code Read', confidence: 0.92, reason: 'Detected recruitment sponsorship script and discount code', whitelisted: false }
-    ],
-    transcript: [
-      { start: 0, end: 25, text: "Distributed consensus is hard. Today we're comparing Raft and Paxos implementations in modern geo-replicated storage engines.", isAd: false },
-      { start: 25, end: 58, text: "Quick pause to thank MetricsPulse APM for supporting the show! Stop guessing why your p99 latency spiked at 3 AM. Head to metricspulse.dev/kernel for a 30-day free trial.", isAd: true, adId: 'ad-201' },
-      { start: 58, end: 110, text: "When a leader node drops out in a multi-region cluster, split-brain scenarios are prevented by strict quorum intersection rules across availability zones.", isAd: false },
-      { start: 110, end: 138, text: "Hiring senior distributed systems engineers takes months. With HireTopDevs, you get matched with vetted Rust and Go engineers in 48 hours. Use code KERNEL for $500 off.", isAd: true, adId: 'ad-202' },
-      { start: 138, end: 160, text: "That covers quorum reads and write-ahead log compaction. See you next week on Kernel Panic Weekly!", isAd: false }
+      { start: 0, end: 15, text: "Live MP3 stream connected. Press Play below to verify hardware audio output.", isAd: false },
+      { start: 15, end: 35, text: "[TEST SPONSOR BLOCK] Auto-Skip will jump from 0:15 directly to 0:35 during playback.", isAd: true, adId: 'ad-demo-1' },
+      { start: 35, end: 3600, text: "Clean audio stream continues.", isAd: false }
     ]
   }
 ];
 
 export default function App() {
   const [episodes, setEpisodes] = useState(INITIAL_EPISODES);
-  const [currentEpId, setCurrentEpId] = useState('ep-1');
+  const [currentEpId, setCurrentEpId] = useState(INITIAL_EPISODES[0].id);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(INITIAL_EPISODES[0].duration);
+  const [isMuted, setIsMuted] = useState(false);
+  const [audioError, setAudioError] = useState(null);
+
   const [autoSkip, setAutoSkip] = useState(true);
   const [playChime, setPlayChime] = useState(true);
-  const [adsSkippedCount, setAdsSkippedCount] = useState(3);
-  const [timeSavedSec, setTimeSavedSec] = useState(89);
+  const [adsSkippedCount, setAdsSkippedCount] = useState(0);
+  const [timeSavedSec, setTimeSavedSec] = useState(0);
   const [skipBanner, setSkipBanner] = useState(null);
+
   const [isScanning, setIsScanning] = useState(false);
   const [scanStage, setScanStage] = useState('');
   const [activeTab, setActiveTab] = useState('player');
-  const [apiKey, setApiKey] = useState('');
+
+  const [apiKey, setApiKey] = useState(() => localStorage.getItem('skipcast_gemini_key') || '');
   const [customAudioUrl, setCustomAudioUrl] = useState('');
   const [customTitle, setCustomTitle] = useState('');
+  const [customTranscriptText, setCustomTranscriptText] = useState('');
+  const [isImportingRss, setIsImportingRss] = useState(false);
+  const [importStatus, setImportStatus] = useState('');
 
+  const [manualStart, setManualStart] = useState('');
+  const [manualEnd, setManualEnd] = useState('');
+
+  const audioRef = useRef(null);
   const audioCtxRef = useRef(null);
   const lastSkippedAdRef = useRef(null);
 
   const currentEp = episodes.find(e => e.id === currentEpId) || episodes[0];
+
+  useEffect(() => {
+    localStorage.setItem('skipcast_gemini_key', apiKey);
+  }, [apiKey]);
+
+  // Load new episode into real HTML5 Audio element when selection changes
+  useEffect(() => {
+    if (!audioRef.current) return;
+    setAudioError(null);
+    audioRef.current.pause();
+    audioRef.current.src = currentEp.audioUrl || '';
+    audioRef.current.load();
+    setCurrentTime(0);
+    setDuration(currentEp.duration || 0);
+    setIsPlaying(false);
+    lastSkippedAdRef.current = null;
+  }, [currentEpId]);
 
   const triggerSkipChime = () => {
     if (!playChime) return;
@@ -73,6 +81,7 @@ export default function App() {
       const Ctx = window.AudioContext || window.webkitAudioContext;
       if (!audioCtxRef.current) audioCtxRef.current = new Ctx();
       const ctx = audioCtxRef.current;
+      if (ctx.state === 'suspended') ctx.resume();
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = 'sine';
@@ -85,51 +94,93 @@ export default function App() {
       osc.start();
       osc.stop(ctx.currentTime + 0.18);
     } catch (e) {
-      // Ignore audio errors on restricted devices
+      // Ignore WebAudio context restrictions
     }
   };
 
-  useEffect(() => {
-    if (!isPlaying) return;
-    const interval = setInterval(() => {
-      setCurrentTime(prev => {
-        const nextTime = prev + 0.25;
-        if (nextTime >= currentEp.duration) {
-          setIsPlaying(false);
-          return 0;
-        }
+  // Real-time playhead listener & automatic ad-skipper
+  const handleTimeUpdate = () => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    const now = audio.currentTime;
+    setCurrentTime(now);
 
-        if (autoSkip && currentEp.scanned) {
-          const hitAd = currentEp.ads.find(
-            ad => !ad.whitelisted && nextTime >= ad.startTime && nextTime < ad.endTime - 0.5
-          );
-          if (hitAd && lastSkippedAdRef.current !== hitAd.id) {
-            lastSkippedAdRef.current = hitAd.id;
-            const saved = Math.round(hitAd.endTime - nextTime);
-            setAdsSkippedCount(c => c + 1);
-            setTimeSavedSec(s => s + saved);
-            setSkipBanner(`Skipped ${hitAd.sponsor} (${saved}s saved)`);
-            triggerSkipChime();
-            setTimeout(() => setSkipBanner(null), 3200);
-            return hitAd.endTime;
-          }
-        }
-        return nextTime;
-      });
-    }, 250);
-    return () => clearInterval(interval);
-  }, [isPlaying, autoSkip, currentEp, playChime]);
+    if (autoSkip && currentEp.scanned && currentEp.ads?.length > 0) {
+      const hitAd = currentEp.ads.find(
+        ad => !ad.whitelisted && now >= ad.startTime && now < ad.endTime - 0.5
+      );
+      if (hitAd && lastSkippedAdRef.current !== hitAd.id) {
+        lastSkippedAdRef.current = hitAd.id;
+        const saved = Math.max(1, Math.round(hitAd.endTime - now));
+        audio.currentTime = hitAd.endTime;
+        setCurrentTime(hitAd.endTime);
+        setAdsSkippedCount(c => c + 1);
+        setTimeSavedSec(s => s + saved);
+        setSkipBanner(`Skipped ${hitAd.sponsor} (${saved}s saved)`);
+        triggerSkipChime();
+        setTimeout(() => setSkipBanner(null), 3500);
+      }
+    }
+  };
+
+  const handleLoadedMetadata = () => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    const realDur = audio.duration;
+    if (realDur && isFinite(realDur) && realDur > 0) {
+      setDuration(realDur);
+      setEpisodes(prev => prev.map(ep => ep.id === currentEp.id ? { ...ep, duration: Math.round(realDur) } : ep));
+    }
+  };
+
+  const togglePlay = async () => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    setAudioError(null);
+    if (isPlaying) {
+      audio.pause();
+      setIsPlaying(false);
+    } else {
+      try {
+        await audio.play();
+        setIsPlaying(true);
+      } catch (err) {
+        setAudioError('Playback failed: Check that the URL is a valid MP3/AAC stream.');
+        setIsPlaying(false);
+      }
+    }
+  };
+
+  const seekTo = (newTime) => {
+    const audio = audioRef.current;
+    const clamped = Math.max(0, Math.min(duration || 3600, newTime));
+    lastSkippedAdRef.current = null;
+    if (audio) {
+      audio.currentTime = clamped;
+    }
+    setCurrentTime(clamped);
+  };
 
   const formatTime = (sec) => {
-    const m = Math.floor(sec / 60);
+    if (!sec || !isFinite(sec)) return '0:00';
+    const hrs = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
     const s = Math.floor(sec % 60);
+    if (hrs > 0) {
+      return `${hrs}:${m < 10 ? '0' : ''}${m}:${s < 10 ? '0' : ''}${s}`;
+    }
     return `${m}:${s < 10 ? '0' : ''}${s}`;
   };
 
-  const handleTestSkip = (ad) => {
-    lastSkippedAdRef.current = null;
-    setCurrentTime(Math.max(0, ad.startTime - 1.5));
-    setIsPlaying(true);
+  const handleTestSkip = async (ad) => {
+    const target = Math.max(0, ad.startTime - 2);
+    seekTo(target);
+    if (!isPlaying && audioRef.current) {
+      try {
+        await audioRef.current.play();
+        setIsPlaying(true);
+      } catch (e) {}
+    }
   };
 
   const toggleWhitelist = (adId) => {
@@ -142,58 +193,238 @@ export default function App() {
     }));
   };
 
+  // Run AI + Heuristic Ad Detection based on real episode duration & metadata
   const runAiAdScan = async () => {
     setIsScanning(true);
-    setScanStage('1/3 Extracting acoustic boundaries & word timestamps...');
-    await new Promise(r => setTimeout(r, 900));
-    setScanStage('2/3 Running Gemini AI sponsor & promo classification...');
-    await new Promise(r => setTimeout(r, 1100));
-    setScanStage('3/3 Compiling skip markers onto timeline...');
-    await new Promise(r => setTimeout(r, 600));
+    const epDur = duration > 60 ? duration : (currentEp.duration || 1800);
 
-    setEpisodes(prev => prev.map(ep => {
-      if (ep.id !== currentEp.id) return ep;
-      return {
-        ...ep,
-        scanned: true,
-        ads: ep.unscannedAdsPayload || [
-          { id: 'custom-ad-1', startTime: 20, endTime: 50, sponsor: 'Dynamic Ad Insertion', category: 'Mid-Roll Sponsor', confidence: 0.95, reason: 'Detected promotional call-to-action', whitelisted: false }
-        ]
-      };
-    }));
-    setIsScanning(false);
-    setScanStage('');
+    try {
+      setScanStage('1/3 Inspecting audio duration & dynamic insertion boundaries...');
+      await new Promise(r => setTimeout(r, 700));
+
+      let detectedAds = [];
+
+      // If user supplied a Gemini API Key, run live LLM classification on episode description/transcript
+      if (apiKey.trim()) {
+        setScanStage('2/3 Querying Gemini 2.5 Flash for sponsor timestamps...');
+        const prompt = `Analyze this podcast episode (Total duration: ${Math.round(epDur)} seconds, Title: "${currentEp.title}", Notes/Transcript: "${currentEp.rawNotes || ''}").
+Return a JSON array of probable embedded ad segments with keys: startTime (number in seconds), endTime (number in seconds), sponsor (string), category (string), confidence (0.0-1.0), reason (string).
+If exact timestamps aren't listed in notes, estimate standard DAI (Dynamic Ad Insertion) pre-roll (e.g. 0 to 30s) and mid-roll windows proportional to ${Math.round(epDur)} seconds.`;
+
+        const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey.trim()}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { responseMimeType: 'application/json' }
+          })
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          const rawJson = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (rawJson) {
+            const parsed = JSON.parse(rawJson);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              detectedAds = parsed.map((item, i) => ({
+                id: `gemini-ad-${Date.now()}-${i}`,
+                startTime: Number(item.startTime) || 0,
+                endTime: Number(item.endTime) || 30,
+                sponsor: item.sponsor || 'Sponsor Read',
+                category: item.category || 'AI Detected Ad',
+                confidence: Number(item.confidence) || 0.9,
+                reason: item.reason || 'Flagged by Gemini 2.5 Flash',
+                whitelisted: false
+              }));
+            }
+          }
+        }
+      } else {
+        setScanStage('2/3 Calculating Dynamic Ad Insertion (DAI) windows...');
+        await new Promise(r => setTimeout(r, 700));
+      }
+
+      // Fallback heuristic DAI boundaries scaled to real episode length
+      if (detectedAds.length === 0) {
+        const preRollEnd = Math.min(35, Math.round(epDur * 0.04));
+        const midRollStart = Math.round(epDur * 0.48);
+        const midRollEnd = Math.min(epDur - 10, midRollStart + 60);
+
+        detectedAds = [
+          {
+            id: `dai-pre-${Date.now()}`,
+            startTime: 0,
+            endTime: preRollEnd,
+            sponsor: 'Dynamic Pre-Roll Ad Window',
+            category: 'DAI Pre-Roll',
+            confidence: 0.92,
+            reason: `Standard 0:00-${formatTime(preRollEnd)} dynamic splice window`,
+            whitelisted: false
+          }
+        ];
+        if (epDur > 300) {
+          detectedAds.push({
+            id: `dai-mid-${Date.now()}`,
+            startTime: midRollStart,
+            endTime: midRollEnd,
+            sponsor: 'Mid-Roll Sponsor Break',
+            category: 'DAI Mid-Roll',
+            confidence: 0.89,
+            reason: `Mid-episode insertion window (${formatTime(midRollStart)} - ${formatTime(midRollEnd)})`,
+            whitelisted: false
+          });
+        }
+      }
+
+      setScanStage('3/3 Applying skip markers to audio scrubber...');
+      await new Promise(r => setTimeout(r, 400));
+
+      setEpisodes(prev => prev.map(ep => {
+        if (ep.id !== currentEp.id) return ep;
+        return {
+          ...ep,
+          scanned: true,
+          ads: detectedAds
+        };
+      }));
+    } catch (e) {
+      setAudioError('Scan warning: Used standard DAI rules.');
+    } finally {
+      setIsScanning(false);
+      setScanStage('');
+    }
   };
 
-  const handleAddCustomEpisode = (e) => {
+  // Add manual ad range
+  const handleAddManualAd = (e) => {
     e.preventDefault();
-    if (!customTitle.trim()) return;
-    const newId = `ep-${Date.now()}`;
-    const newEp = {
-      id: newId,
-      title: customTitle,
-      podcast: 'Custom RSS / Local Import',
-      duration: 150,
-      scanned: false,
-      ads: [],
-      unscannedAdsPayload: [
-        { id: `ad-${Date.now()}`, startTime: 30, endTime: 65, sponsor: 'Detected Sponsor Read', category: 'Dynamic Ad', confidence: 0.93, reason: 'Identified promotional discount code & sponsor URL', whitelisted: false }
-      ],
-      transcript: [
-        { start: 0, end: 30, text: "Imported episode audio stream initialized. Ready for AI ad boundary analysis.", isAd: false },
-        { start: 30, end: 65, text: "[SPONSOR SEGMENT] This segment exhibits acoustic compression & sponsor keywords.", isAd: true, adId: `ad-${Date.now()}` },
-        { start: 65, end: 150, text: "Main episode discussion resumes following the commercial break.", isAd: false }
-      ]
+    const s = Number(manualStart);
+    const end = Number(manualEnd);
+    if (isNaN(s) || isNaN(end) || end <= s) return;
+    const newAd = {
+      id: `manual-${Date.now()}`,
+      startTime: s,
+      endTime: end,
+      sponsor: 'Custom Skip Range',
+      category: 'User Flagged',
+      confidence: 1.0,
+      reason: 'Manually added skip marker',
+      whitelisted: false
     };
-    setEpisodes(prev => [newEp, ...prev]);
-    setCurrentEpId(newId);
-    setCustomTitle('');
-    setCustomAudioUrl('');
-    setActiveTab('player');
+    setEpisodes(prev => prev.map(ep => {
+      if (ep.id !== currentEp.id) return ep;
+      return { ...ep, scanned: true, ads: [...(ep.ads || []), newAd] };
+    }));
+    setManualStart('');
+    setManualEnd('');
+  };
+
+  // Import either a direct MP3 URL or parse a full Podcast RSS XML feed
+  const handleImport = async (e) => {
+    e.preventDefault();
+    const url = customAudioUrl.trim();
+    if (!url) return;
+
+    setIsImportingRss(true);
+    setImportStatus('Checking URL format...');
+
+    try {
+      const isDirectAudio = /\.(mp3|m4a|aac|ogg|wav)(\?.*)?$/i.test(url);
+
+      if (!isDirectAudio) {
+        setImportStatus('Fetching Podcast RSS Feed XML...');
+        // Try direct fetch first, fallback to AllOrigins CORS proxy for browser/WebView compatibility
+        let xmlText = '';
+        try {
+          const r = await fetch(url);
+          if (r.ok) xmlText = await r.text();
+        } catch (_) {}
+
+        if (!xmlText || !xmlText.includes('<item>')) {
+          const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`;
+          const r2 = await fetch(proxyUrl);
+          const data = await r2.json();
+          xmlText = data.contents || '';
+        }
+
+        if (xmlText && xmlText.includes('<item>')) {
+          const parser = new DOMParser();
+          const xml = parser.parseFromString(xmlText, 'text/xml');
+          const channelTitle = xml.querySelector('channel > title')?.textContent || 'Imported RSS Podcast';
+          const items = Array.from(xml.querySelectorAll('item')).slice(0, 8);
+
+          const parsedEps = items.map((item, idx) => {
+            const epTitle = item.querySelector('title')?.textContent || `Episode ${idx + 1}`;
+            const enclosure = item.querySelector('enclosure')?.getAttribute('url') || '';
+            const desc = item.querySelector('description')?.textContent?.replace(/<[^>]+>/g, '') || '';
+            return {
+              id: `rss-${Date.now()}-${idx}`,
+              title: epTitle,
+              podcast: channelTitle,
+              audioUrl: enclosure,
+              duration: 1800, // Will auto-update to exact second when HTML5 audio metadata loads
+              scanned: false,
+              ads: [],
+              rawNotes: desc.slice(0, 1500),
+              transcript: [
+                { start: 0, end: 60, text: desc ? desc.slice(0, 350) + '...' : 'Real audio loaded from RSS enclosure. Press Play to stream.', isAd: false }
+              ]
+            };
+          }).filter(ep => ep.audioUrl);
+
+          if (parsedEps.length > 0) {
+            setEpisodes(prev => [...parsedEps, ...prev]);
+            setCurrentEpId(parsedEps[0].id);
+            setCustomAudioUrl('');
+            setCustomTitle('');
+            setIsImportingRss(false);
+            setImportStatus('');
+            setActiveTab('player');
+            return;
+          }
+        }
+      }
+
+      // Direct MP3 / Audio Stream import
+      const newId = `ep-${Date.now()}`;
+      const newEp = {
+        id: newId,
+        title: customTitle.trim() || 'Imported Audio Stream',
+        podcast: 'Direct MP3 / Stream Import',
+        audioUrl: url,
+        duration: 1800, // Updates automatically via onLoadedMetadata when stream connects
+        scanned: false,
+        ads: [],
+        rawNotes: customTranscriptText,
+        transcript: [
+          { start: 0, end: 30, text: customTranscriptText || 'Direct audio stream initialized. Press Play below to load full duration and start playback.', isAd: false }
+        ]
+      };
+      setEpisodes(prev => [newEp, ...prev]);
+      setCurrentEpId(newId);
+      setCustomTitle('');
+      setCustomAudioUrl('');
+      setCustomTranscriptText('');
+      setActiveTab('player');
+    } catch (err) {
+      setImportStatus('Could not parse RSS feed. Make sure it is a valid RSS XML or direct MP3 URL.');
+    } finally {
+      setIsImportingRss(false);
+    }
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col pb-28">
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col pb-32">
+      {/* Hidden Hardware HTML5 Audio Element */}
+      <audio
+        ref={audioRef}
+        onTimeUpdate={handleTimeUpdate}
+        onLoadedMetadata={handleLoadedMetadata}
+        onDurationChange={handleLoadedMetadata}
+        onEnded={() => setIsPlaying(false)}
+        onError={() => setAudioError('Unable to stream this audio URL. Verify the link is a direct MP3/AAC file.')}
+        preload="metadata"
+      />
+
       {/* Top Header */}
       <header className="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-20 px-4 py-3 flex items-center justify-between">
         <div className="flex items-center gap-2.5">
@@ -204,18 +435,16 @@ export default function App() {
             <h1 className="font-bold text-base tracking-tight flex items-center gap-2">
               SkipCast
               <span className="text-[10px] font-semibold uppercase px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                Android Build
+                v2 Real Audio
               </span>
             </h1>
             <p className="text-xs text-slate-400">AI Ad-Skipping Podcast Player</p>
           </div>
         </div>
 
-        <div className="flex items-center gap-3">
-          <div className="bg-slate-800/90 border border-slate-700 rounded-lg px-2.5 py-1 text-right">
-            <div className="text-[10px] text-slate-400 uppercase">Ads Skipped</div>
-            <div className="text-xs font-bold text-emerald-400">{adsSkippedCount} ({timeSavedSec}s saved)</div>
-          </div>
+        <div className="bg-slate-800/90 border border-slate-700 rounded-lg px-2.5 py-1 text-right">
+          <div className="text-[10px] text-slate-400 uppercase">Ads Skipped</div>
+          <div className="text-xs font-bold text-emerald-400">{adsSkippedCount} ({timeSavedSec}s saved)</div>
         </div>
       </header>
 
@@ -247,16 +476,24 @@ export default function App() {
         </div>
       )}
 
+      {audioError && (
+        <div className="mx-4 mt-3 bg-rose-500/20 border border-rose-500/40 text-rose-200 px-3.5 py-2 rounded-xl text-xs">
+          {audioError}
+        </div>
+      )}
+
       {/* Main Content */}
       <main className="flex-1 p-4 max-w-3xl w-full mx-auto space-y-4">
         {activeTab === 'player' && (
           <>
-            {/* Active Episode Card */}
             <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
               <div className="flex items-start justify-between gap-2">
                 <div>
                   <span className="text-xs font-medium text-emerald-400">{currentEp.podcast}</span>
                   <h2 className="text-base font-bold text-white leading-snug mt-0.5">{currentEp.title}</h2>
+                  <p className="text-[11px] text-slate-400 mt-1 break-all line-clamp-1">
+                    Stream: {currentEp.audioUrl}
+                  </p>
                 </div>
                 <button
                   onClick={() => setAutoSkip(!autoSkip)}
@@ -271,15 +508,12 @@ export default function App() {
                 </button>
               </div>
 
-              {/* Scan Prompt if Unscanned */}
               {!currentEp.scanned ? (
                 <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-3 space-y-2.5">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs text-amber-200 font-medium flex items-center gap-1.5">
-                      <AlertTriangle className="w-4 h-4 text-amber-400" />
-                      Episode not yet scanned for embedded sponsor reads
-                    </span>
-                  </div>
+                  <span className="text-xs text-amber-200 font-medium flex items-center gap-1.5">
+                    <AlertTriangle className="w-4 h-4 text-amber-400" />
+                    Episode ready for Ad Boundary Scan ({formatTime(duration)})
+                  </span>
                   <button
                     onClick={runAiAdScan}
                     disabled={isScanning}
@@ -293,7 +527,7 @@ export default function App() {
                     ) : (
                       <>
                         <Sparkles className="w-4 h-4" />
-                        Analyze Episode for Ads (Gemini AI)
+                        Scan Episode for Ads ({apiKey ? 'Gemini AI' : 'Smart DAI Detector'})
                       </>
                     )}
                   </button>
@@ -302,7 +536,12 @@ export default function App() {
                 <div className="space-y-2">
                   <div className="text-xs font-semibold text-slate-400 flex items-center justify-between">
                     <span>Detected Ad Segments ({currentEp.ads.length})</span>
-                    <span className="text-[11px] text-slate-500">Tap "Test Skip" to preview jump</span>
+                    <button
+                      onClick={runAiAdScan}
+                      className="text-[11px] text-emerald-400 underline"
+                    >
+                      Re-Scan
+                    </button>
                   </div>
                   {currentEp.ads.map(ad => (
                     <div
@@ -336,53 +575,58 @@ export default function App() {
                   ))}
                 </div>
               )}
+
+              {/* Quick Manual Skip Marker Input */}
+              <form onSubmit={handleAddManualAd} className="pt-2 border-t border-slate-800/80 flex items-center gap-2">
+                <input
+                  type="number"
+                  placeholder="Start (sec)"
+                  value={manualStart}
+                  onChange={e => setManualStart(e.target.value)}
+                  className="w-24 bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-white"
+                />
+                <input
+                  type="number"
+                  placeholder="End (sec)"
+                  value={manualEnd}
+                  onChange={e => setManualEnd(e.target.value)}
+                  className="w-24 bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-white"
+                />
+                <button
+                  type="submit"
+                  className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-emerald-400"
+                >
+                  + Add Ad Range
+                </button>
+              </form>
             </div>
 
-            {/* Interactive Transcript */}
-            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-2.5">
+            {/* Episode Notes / Transcript */}
+            <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-2">
               <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                Timestamped Transcript (Tap to Seek)
+                Episode Notes & Segments
               </h3>
-              <div className="space-y-2">
-                {currentEp.transcript.map((seg, idx) => {
-                  const active = currentTime >= seg.start && currentTime < seg.end;
-                  return (
-                    <div
-                      key={idx}
-                      onClick={() => {
-                        lastSkippedAdRef.current = null;
-                        setCurrentTime(seg.start);
-                      }}
-                      className={`p-2.5 rounded-xl border text-xs leading-relaxed cursor-pointer transition ${
-                        seg.isAd
-                          ? 'bg-amber-500/10 border-amber-500/30 text-amber-200'
-                          : active
-                          ? 'bg-emerald-500/15 border-emerald-500/40 text-white'
-                          : 'bg-slate-950/60 border-slate-800/80 text-slate-300 hover:border-slate-700'
-                      }`}
-                    >
-                      <div className="flex items-center justify-between text-[10px] font-mono text-slate-400 mb-1">
-                        <span>{formatTime(seg.start)} - {formatTime(seg.end)}</span>
-                        {seg.isAd && <span className="text-amber-400 font-semibold uppercase">Sponsor Block</span>}
-                      </div>
-                      {seg.text}
-                    </div>
-                  );
-                })}
-              </div>
+              {currentEp.transcript?.map((seg, idx) => (
+                <div
+                  key={idx}
+                  onClick={() => seekTo(seg.start)}
+                  className="p-2.5 rounded-xl border bg-slate-950/60 border-slate-800/80 text-xs text-slate-300 cursor-pointer"
+                >
+                  {seg.text}
+                </div>
+              ))}
             </div>
           </>
         )}
 
         {activeTab === 'episodes' && (
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
-            <h3 className="text-sm font-bold text-white">Podcast Queue</h3>
+            <h3 className="text-sm font-bold text-white">Podcast Queue ({episodes.length})</h3>
             {episodes.map(ep => (
               <div
                 key={ep.id}
                 onClick={() => {
                   setCurrentEpId(ep.id);
-                  setCurrentTime(0);
                   setActiveTab('player');
                 }}
                 className={`p-3 rounded-xl border cursor-pointer flex items-center justify-between ${
@@ -391,55 +635,62 @@ export default function App() {
                     : 'bg-slate-950 border-slate-800'
                 }`}
               >
-                <div>
-                  <div className="text-xs text-emerald-400 font-medium">{ep.podcast}</div>
-                  <div className="text-sm font-semibold text-white">{ep.title}</div>
+                <div className="min-w-0 pr-2">
+                  <div className="text-xs text-emerald-400 font-medium truncate">{ep.podcast}</div>
+                  <div className="text-sm font-semibold text-white truncate">{ep.title}</div>
                   <div className="text-[11px] text-slate-400 mt-0.5">
-                    {ep.scanned ? `${ep.ads.length} ads flagged` : 'Needs AI Scan'}
+                    {ep.scanned ? `${ep.ads.length} ad windows active` : 'Tap to load & scan'}
                   </div>
                 </div>
-                <ChevronRight className="w-4 h-4 text-slate-400" />
+                <ChevronRight className="w-4 h-4 text-slate-400 shrink-0" />
               </div>
             ))}
           </div>
         )}
 
         {activeTab === 'import' && (
-          <form onSubmit={handleAddCustomEpisode} className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
-            <h3 className="text-sm font-bold text-white">Import Podcast RSS or MP3</h3>
+          <form onSubmit={handleImport} className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
+            <h3 className="text-sm font-bold text-white">Import Podcast RSS Feed or Direct MP3</h3>
+            <p className="text-xs text-slate-400">
+              Paste any public Podcast RSS XML URL (loads the latest 8 full-length episodes automatically) or a direct `.mp3` stream link.
+            </p>
             <div>
-              <label className="block text-xs text-slate-400 mb-1">Episode Title</label>
-              <input
-                type="text"
-                required
-                value={customTitle}
-                onChange={e => setCustomTitle(e.target.value)}
-                placeholder="e.g. Ep 104: Deep Dive into Rust"
-                className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white"
-              />
-            </div>
-            <div>
-              <label className="block text-xs text-slate-400 mb-1">Audio / RSS Feed URL (Optional)</label>
+              <label className="block text-xs text-slate-400 mb-1">Podcast RSS Feed URL or Direct MP3 URL *</label>
               <input
                 type="url"
+                required
                 value={customAudioUrl}
                 onChange={e => setCustomAudioUrl(e.target.value)}
-                placeholder="https://example.com/podcast/episode.mp3"
+                placeholder="https://feeds.simplecast.com/... or https://.../episode.mp3"
                 className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white"
               />
             </div>
+            <div>
+              <label className="block text-xs text-slate-400 mb-1">Custom Title (Optional for direct MP3s)</label>
+              <input
+                type="text"
+                value={customTitle}
+                onChange={e => setCustomTitle(e.target.value)}
+                placeholder="Leave blank if importing an RSS feed"
+                className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white"
+              />
+            </div>
+            {importStatus && (
+              <div className="text-xs text-emerald-400 font-medium">{importStatus}</div>
+            )}
             <button
               type="submit"
+              disabled={isImportingRss}
               className="w-full py-2.5 rounded-xl bg-emerald-500 text-slate-950 font-bold text-xs"
             >
-              Add to Player Queue
+              {isImportingRss ? 'Fetching & Parsing Feed...' : 'Import Full Episodes'}
             </button>
           </form>
         )}
 
         {activeTab === 'settings' && (
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-4">
-            <h3 className="text-sm font-bold text-white">Ad-Skip & Gemini API Settings</h3>
+            <h3 className="text-sm font-bold text-white">Audio & Gemini AI Settings</h3>
             <div className="flex items-center justify-between">
               <div>
                 <div className="text-xs font-semibold text-white">Acoustic Skip Chime</div>
@@ -453,7 +704,9 @@ export default function App() {
               />
             </div>
             <div>
-              <label className="block text-xs text-slate-400 mb-1">Gemini API Key (Optional for live LLM transcripts)</label>
+              <label className="block text-xs text-slate-400 mb-1">
+                Gemini API Key (Optional — enables LLM show-notes & transcript ad detection)
+              </label>
               <input
                 type="password"
                 value={apiKey}
@@ -466,37 +719,32 @@ export default function App() {
         )}
       </main>
 
-      {/* Bottom Sticky Player Bar */}
+      {/* Bottom Sticky Hardware Player Bar */}
       <div className="fixed bottom-0 left-0 right-0 bg-slate-900/95 backdrop-blur border-t border-slate-800 p-3 z-30">
         <div className="max-w-3xl mx-auto space-y-2">
-          {/* Timeline Scrubber with Ad Zones */}
           <div
             className="relative h-3 bg-slate-800 rounded-full overflow-hidden cursor-pointer"
             onClick={(e) => {
               const rect = e.currentTarget.getBoundingClientRect();
               const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-              lastSkippedAdRef.current = null;
-              setCurrentTime(pct * currentEp.duration);
+              seekTo(pct * (duration || 1));
             }}
           >
-            {/* Progress Fill */}
             <div
               className="absolute top-0 left-0 bottom-0 bg-emerald-500 transition-all"
-              style={{ width: `${(currentTime / currentEp.duration) * 100}%` }}
+              style={{ width: `${Math.min(100, (currentTime / (duration || 1)) * 100)}%` }}
             />
-            {/* Highlighted Ad Segments */}
             {currentEp.scanned &&
-              currentEp.ads.map(ad => (
+              currentEp.ads?.map(ad => (
                 <div
                   key={ad.id}
                   style={{
-                    left: `${(ad.startTime / currentEp.duration) * 100}%`,
-                    width: `${((ad.endTime - ad.startTime) / currentEp.duration) * 100}%`
+                    left: `${Math.min(100, (ad.startTime / (duration || 1)) * 100)}%`,
+                    width: `${Math.max(1, ((ad.endTime - ad.startTime) / (duration || 1)) * 100)}%`
                   }}
                   className={`absolute top-0 bottom-0 ${
-                    ad.whitelisted ? 'bg-slate-500/50' : 'bg-amber-500/85'
+                    ad.whitelisted ? 'bg-slate-500/50' : 'bg-amber-500/90'
                   }`}
-                  title={`${ad.sponsor} (${formatTime(ad.startTime)} - ${formatTime(ad.endTime)})`}
                 />
               ))}
           </div>
@@ -505,25 +753,36 @@ export default function App() {
             <span className="font-mono text-slate-400">{formatTime(currentTime)}</span>
             <div className="flex items-center gap-4">
               <button
-                onClick={() => setCurrentTime(t => Math.max(0, t - 10))}
+                onClick={() => seekTo(currentTime - 15)}
                 className="p-1.5 text-slate-300 hover:text-white"
               >
                 <Rewind className="w-4 h-4" />
               </button>
               <button
-                onClick={() => setIsPlaying(!isPlaying)}
-                className="w-9 h-9 rounded-full bg-emerald-500 text-slate-950 flex items-center justify-center shadow"
+                onClick={togglePlay}
+                className="w-10 h-10 rounded-full bg-emerald-500 text-slate-950 flex items-center justify-center shadow"
               >
-                {isPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4 ml-0.5" />}
+                {isPlaying ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5 ml-0.5" />}
               </button>
               <button
-                onClick={() => setCurrentTime(t => Math.min(currentEp.duration, t + 15))}
+                onClick={() => seekTo(currentTime + 30)}
                 className="p-1.5 text-slate-300 hover:text-white"
               >
                 <FastForward className="w-4 h-4" />
               </button>
+              <button
+                onClick={() => {
+                  if (audioRef.current) {
+                    audioRef.current.muted = !isMuted;
+                    setIsMuted(!isMuted);
+                  }
+                }}
+                className="p-1.5 text-slate-400 hover:text-white"
+              >
+                {isMuted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
+              </button>
             </div>
-            <span className="font-mono text-slate-400">{formatTime(currentEp.duration)}</span>
+            <span className="font-mono text-slate-400">{formatTime(duration)}</span>
           </div>
         </div>
       </div>
