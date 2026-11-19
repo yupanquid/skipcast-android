@@ -1216,7 +1216,7 @@ Output ONLY valid JSON.`;
         if (midChunkBase64) requestParts.push({ inlineData: { mimeType: 'audio/mp3', data: midChunkBase64 } });
         if (lateChunkBase64) requestParts.push({ inlineData: { mimeType: 'audio/mp3', data: lateChunkBase64 } });
 
-        const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey.trim()}`, {
+        const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey.trim()}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1286,7 +1286,9 @@ Output ONLY valid JSON.`;
             }
           }
         } else {
-          setAudioError('Gemini API returned an error. Check your API key or quota in Settings.');
+          const errJson = await resp.json().catch(() => null);
+          const errMsg = errJson?.error?.message || `HTTP ${resp.status} ${resp.statusText}`;
+          setAudioError(`Gemini Error: ${errMsg}`);
         }
       }
 
