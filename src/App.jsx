@@ -153,6 +153,87 @@ const arrayBufferToBase64 = (buffer) => {
   return window.btoa(binary);
 };
 
+// Fetch a byte range directly or via CORS proxy
+const fetchAudioRange = async (audioUrl, startByte, endByte) => {
+  const headers = { Range: `bytes=${startByte}-${endByte}` };
+  try {
+    const r = await fetch(audioUrl, { headers });
+    if (r.ok || r.status === 206) {
+      const contentRange = r.headers.get('content-range');
+      let totalBytes = null;
+      if (contentRange && contentRange.includes('/')) {
+        const parsedTotal = Number(contentRange.split('/')[1]);
+        if (!isNaN(parsedTotal) && parsedTotal > 0) totalBytes = parsedTotal;
+      }
+      const buffer = await r.arrayBuffer();
+      if (buffer && buffer.byteLength > 10000) {
+        return { buffer, totalBytes };
+      }
+    }
+  } catch (_) {}
+
+  try {
+    const rProxy = await fetch(`https://corsproxy.io/?${encodeURIComponent(audioUrl)}`, { headers });
+    if (rProxy.ok || rProxy.status === 206) {
+      const contentRange = rProxy.headers.get('content-range');
+      let totalBytes = null;
+      if (contentRange && contentRange.includes('/')) {
+        const parsedTotal = Number(contentRange.split('/')[1]);
+        if (!isNaN(parsedTotal) && parsedTotal > 0) totalBytes = parsedTotal;
+      }
+      const buffer = await rProxy.arrayBuffer();
+      if (buffer && buffer.byteLength > 10000) {
+        return { buffer, totalBytes };
+      }
+    }
+  } catch (_) {}
+
+  return null;
+};
+
+// ACOUSTIC SILENCE SNAPPING: Finds the quietest pause within +/- 2.5s of targetSec
+const snapToNearestSilence = async (audioBufferData, targetSec, chunkStartSec, searchRadiusSec = 2.5) => {
+  if (!audioBufferData) return targetSec;
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    const ctx = new Ctx();
+    const decoded = await ctx.decodeAudioData(audioBufferData.slice(0));
+    const channelData = decoded.getChannelData(0);
+    const sampleRate = decoded.sampleRate;
+    const clipDuration = decoded.duration;
+
+    const relTarget = targetSec - chunkStartSec;
+    if (relTarget < 0 || relTarget > clipDuration) return targetSec;
+
+    const startSearch = Math.max(0, relTarget - searchRadiusSec);
+    const endSearch = Math.min(clipDuration, relTarget + searchRadiusSec);
+
+    const windowSize = Math.floor(sampleRate * 0.05); // 50ms window
+    let minRms = Infinity;
+    let bestRelTime = relTarget;
+
+    for (let t = startSearch; t < endSearch; t += 0.025) { // test every 25ms
+      const startIndex = Math.floor(t * sampleRate);
+      let sumSquares = 0;
+      let count = 0;
+      for (let i = 0; i < windowSize && (startIndex + i) < channelData.length; i++) {
+        const val = channelData[startIndex + i];
+        sumSquares += val * val;
+        count++;
+      }
+      const rms = count > 0 ? Math.sqrt(sumSquares / count) : 0;
+      if (rms < minRms) {
+        minRms = rms;
+        bestRelTime = t;
+      }
+    }
+    ctx.close();
+    return Math.round((chunkStartSec + bestRelTime) * 10) / 10;
+  } catch (_) {
+    return targetSec;
+  }
+};
+
 export default function App() {
   const [episodes, setEpisodes] = useState(() => {
     try {
@@ -266,7 +347,6 @@ export default function App() {
     getAllOfflineKeys().then(keys => setOfflineIds(keys));
   }, []);
 
-  // Load new episode into HTML5 Audio (preferring offline IndexedDB blob if downloaded)
   useEffect(() => {
     let isCancelled = false;
     const loadAudioSource = async () => {
@@ -567,7 +647,6 @@ export default function App() {
     }));
   };
 
-  // QUEUE EDITING ACTIONS: Move Up, Move Down, Remove Track, Clear Completed/Other Tracks
   const moveQueueItem = (index, direction, e) => {
     if (e) e.stopPropagation();
     const targetIndex = index + direction;
@@ -856,7 +935,7 @@ export default function App() {
     }
 
     if (allNewEpisodes.length > 0) {
-      setEpisodes(prev => [...prev, ...allNewEpisodes]);
+      setEpisodes(prev => [...allNewEpisodes, ...prev]);
     }
 
     const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -1026,7 +1105,7 @@ ${outlinesXml}
     setActiveTab('player');
   };
 
-  // DYNAMIC GEMINI 2.5 FLASH DETECTION (NO HARDCODED 2-AD OR 0:00 PRE-ROLL ASSUMPTIONS)
+  // TRI-WINDOW GEMINI 2.5 FLASH AUDIO SCANNER WITH ACOUSTIC SILENCE DIPS
   const runAiAdScan = async () => {
     setIsScanning(true);
     setAudioError(null);
@@ -1036,46 +1115,88 @@ ${outlinesXml}
       let detectedAds = [];
 
       if (!apiKey.trim()) {
-        setAudioError('Add a Gemini API key in Settings to run real audio/transcript ad detection without hardcoded assumptions. You can also add exact ad start/end seconds manually below.');
+        setAudioError('Add a Gemini API key in Settings to run real audio/transcript ad detection. You can also add exact ad start/end seconds manually below.');
         setEpisodes(prev => prev.map(ep => ep.id === currentEp.id ? { ...ep, scanned: true, ads: ep.ads || [] } : ep));
         return;
       }
 
       if (currentEp.audioUrl) {
-        setScanStage('1/3 Fetching audio segment & show notes for dynamic analysis...');
+        const chunkBytes = 2200000; // ~2.2 MB per window (~2.5-3 mins at 128kbps)
+        let startBuffer = null;
+        let midBuffer = null;
+        let lateBuffer = null;
+        let startChunkBase64 = null;
+        let midChunkBase64 = null;
+        let lateChunkBase64 = null;
+        let midStartSec = Math.round(epDur * 0.45);
+        let lateStartSec = Math.round(epDur * 0.75);
 
-        let audioBase64 = null;
-        try {
-          // Sample up to ~3.5MB (~3.5-4.5 mins at 128kbps) via range request
-          let audioChunkResp = null;
-          try {
-            audioChunkResp = await fetch(currentEp.audioUrl, {
-              headers: { Range: 'bytes=0-3670016' }
-            });
-          } catch (_) {
-            audioChunkResp = await fetch(`https://corsproxy.io/?${encodeURIComponent(currentEp.audioUrl)}`, {
-              headers: { Range: 'bytes=0-3670016' }
-            });
+        // 1. Fetch opening audio window (~0:00 onward)
+        setScanStage('1/5 Sampling opening audio chunk...');
+        const startRange = await fetchAudioRange(currentEp.audioUrl, 0, chunkBytes - 1);
+        if (startRange?.buffer) {
+          startBuffer = startRange.buffer;
+          startChunkBase64 = arrayBufferToBase64(startRange.buffer);
+        }
+
+        const estimatedBytesPerSec = startRange?.totalBytes
+          ? startRange.totalBytes / epDur
+          : 16000; // ~128kbps fallback
+
+        // 2. Fetch mid-episode audio window (~45% into the episode)
+        if (epDur > 180) {
+          setScanStage('2/5 Fetching mid-episode audio chunk (~45%)...');
+          const midStartByte = Math.max(
+            chunkBytes + 65536,
+            Math.round(epDur * 0.45 * estimatedBytesPerSec)
+          );
+          midStartSec = Math.max(30, Math.round(midStartByte / estimatedBytesPerSec));
+          const midEndByte = midStartByte + chunkBytes - 1;
+
+          const midRange = await fetchAudioRange(currentEp.audioUrl, midStartByte, midEndByte);
+          if (midRange?.buffer) {
+            midBuffer = midRange.buffer;
+            midChunkBase64 = arrayBufferToBase64(midRange.buffer);
           }
+        }
 
-          if (audioChunkResp && (audioChunkResp.ok || audioChunkResp.status === 206)) {
-            const buf = await audioChunkResp.arrayBuffer();
-            if (buf && buf.byteLength > 20000) {
-              audioBase64 = arrayBufferToBase64(buf);
-            }
+        // 3. Fetch late-roll audio window (~75% into the episode)
+        if (epDur > 300) {
+          setScanStage('3/5 Fetching late-roll audio chunk (~75%)...');
+          const lateStartByte = Math.max(
+            chunkBytes * 2 + 131072,
+            Math.round(epDur * 0.75 * estimatedBytesPerSec)
+          );
+          lateStartSec = Math.max(midStartSec + 60, Math.round(lateStartByte / estimatedBytesPerSec));
+          const lateEndByte = lateStartByte + chunkBytes - 1;
+
+          const lateRange = await fetchAudioRange(currentEp.audioUrl, lateStartByte, lateEndByte);
+          if (lateRange?.buffer) {
+            lateBuffer = lateRange.buffer;
+            lateChunkBase64 = arrayBufferToBase64(lateRange.buffer);
           }
-        } catch (_) {}
+        }
 
-        setScanStage('2/3 Analyzing audio stream with Gemini 2.5 Flash...');
+        setScanStage('4/5 Analyzing opening, mid & late audio with Gemini 2.5 Flash...');
 
-        const promptText = `You are a precision podcast ad-boundary detector.
-Analyze this podcast episode audio and metadata (Total Episode Duration: ${Math.round(epDur)} seconds, Episode Title: "${currentEp.title}", Show Notes: "${(currentEp.rawNotes || '').slice(0, 1500)}").
+        const promptText = `You are a precision podcast ad-boundary detector analyzing real audio clips from a podcast episode.
+Episode Metadata:
+- Title: "${currentEp.title}"
+- Total Duration: ${Math.round(epDur)} seconds
+- Show Notes: "${(currentEp.rawNotes || '').slice(0, 1500)}"
 
-Rules:
-- Do NOT assume there are 2 ads or that an ad starts at 0:00 unless you actually hear/find an ad there.
-- Identify ANY number of ads (0, 1, 2, 3, 4, or more) wherever host-read sponsorships, promo codes, sponsor URLs, transition jingles, or dynamically inserted ads occur in the sampled audio or are indicated in the show notes.
-- Return only intervals where startTime < endTime and endTime <= ${Math.round(epDur)}.
-- If no ads are detected in the sampled audio or notes, return an empty JSON array [].
+Attached Audio Chunks:
+1. Clip 1 (Opening sample): starts at 0 seconds in the episode.
+${midChunkBase64 ? `2. Clip 2 (Mid-episode sample): starts at approximately ${midStartSec} seconds into the episode.` : ''}
+${lateChunkBase64 ? `3. Clip 3 (Late-roll sample): starts at approximately ${lateStartSec} seconds into the episode.` : ''}
+
+Instructions:
+- Listen carefully to ALL attached audio clips for host-read sponsorships, promo codes, sponsor URLs, transition jingles/stingers, or dynamically inserted ads.
+- Convert timestamps relative to Clip 2 into full-episode seconds by adding ~${midStartSec}s when an ad is heard in Clip 2.
+- Convert timestamps relative to Clip 3 into full-episode seconds by adding ~${lateStartSec}s when an ad is heard in Clip 3.
+- Do NOT assume a fixed number of ads or force an ad at 0:00 if none is present.
+- Return only intervals where 0 <= startTime < endTime <= ${Math.round(epDur)}.
+- If no ads are detected in any audio clip or show notes, return [].
 
 Return a valid JSON array with this structure:
 [
@@ -1083,22 +1204,17 @@ Return a valid JSON array with this structure:
     "startTime": <number in seconds>,
     "endTime": <number in seconds>,
     "sponsor": "<string: sponsor name or ad type>",
-    "category": "<Host-Read Sponsor | Dynamic Ad | Promo Read | Sponsor Stinger>",
+    "category": "<Host-Read Sponsor | Mid-Roll Ad | Late-Roll Ad | Dynamic Ad | Promo Read>",
     "confidence": <number between 0.5 and 0.99>,
-    "reason": "<specific audio or show-notes cue>"
+    "reason": "<specific vocal/acoustic cue in opening, mid-roll, or late-roll clip>"
   }
 ]
 Output ONLY valid JSON.`;
 
         const requestParts = [{ text: promptText }];
-        if (audioBase64) {
-          requestParts.push({
-            inlineData: {
-              mimeType: 'audio/mp3',
-              data: audioBase64
-            }
-          });
-        }
+        if (startChunkBase64) requestParts.push({ inlineData: { mimeType: 'audio/mp3', data: startChunkBase64 } });
+        if (midChunkBase64) requestParts.push({ inlineData: { mimeType: 'audio/mp3', data: midChunkBase64 } });
+        if (lateChunkBase64) requestParts.push({ inlineData: { mimeType: 'audio/mp3', data: lateChunkBase64 } });
 
         const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey.trim()}`, {
           method: 'POST',
@@ -1114,29 +1230,65 @@ Output ONLY valid JSON.`;
           const rawJson = data?.candidates?.[0]?.content?.parts?.[0]?.text;
           if (rawJson) {
             const parsed = JSON.parse(rawJson);
-            if (Array.isArray(parsed)) {
-              detectedAds = parsed
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              setScanStage('5/5 Snapping ad boundaries to acoustic silence dips...');
+
+              const rawAds = parsed
                 .map((item, i) => ({
                   id: `gemini-audio-${Date.now()}-${i}`,
                   startTime: Math.max(0, Math.round(Number(item.startTime) || 0)),
                   endTime: Math.min(Math.round(epDur), Math.round(Number(item.endTime) || 0)),
                   sponsor: item.sponsor || 'Sponsor Read',
-                  category: item.category || 'Gemini Audio Analysis',
+                  category: item.category || 'Gemini Tri-Window AI',
                   confidence: Number(item.confidence) || 0.9,
                   reason: item.reason || 'Detected by Gemini 2.5 Flash',
                   whitelisted: false
                 }))
-                .filter(ad => ad.endTime > ad.startTime)
-                .sort((a, b) => a.startTime - b.startTime);
+                .filter(ad => ad.endTime > ad.startTime);
+
+              // Snapping each ad boundary to the nearest silence dip in the corresponding audio buffer
+              for (const ad of rawAds) {
+                // Determine which clip contains startTime and endTime
+                let startBufferToUse = null;
+                let startChunkOffset = 0;
+                if (ad.startTime < midStartSec) {
+                  startBufferToUse = startBuffer;
+                  startChunkOffset = 0;
+                } else if (ad.startTime < lateStartSec) {
+                  startBufferToUse = midBuffer;
+                  startChunkOffset = midStartSec;
+                } else {
+                  startBufferToUse = lateBuffer;
+                  startChunkOffset = lateStartSec;
+                }
+
+                let endBufferToUse = null;
+                let endChunkOffset = 0;
+                if (ad.endTime < midStartSec) {
+                  endBufferToUse = startBuffer;
+                  endChunkOffset = 0;
+                } else if (ad.endTime < lateStartSec) {
+                  endBufferToUse = midBuffer;
+                  endChunkOffset = midStartSec;
+                } else {
+                  endBufferToUse = lateBuffer;
+                  endChunkOffset = lateStartSec;
+                }
+
+                const snappedStart = await snapToNearestSilence(startBufferToUse, ad.startTime, startChunkOffset);
+                const snappedEnd = await snapToNearestSilence(endBufferToUse, ad.endTime, endChunkOffset);
+
+                ad.startTime = Math.min(snappedStart, ad.endTime - 1);
+                ad.endTime = Math.max(snappedEnd, ad.startTime + 1);
+              }
+
+              detectedAds = rawAds.sort((a, b) => a.startTime - b.startTime);
             }
           }
         } else {
           setAudioError('Gemini API returned an error. Check your API key or quota in Settings.');
         }
       }
-
-      setScanStage('3/3 Updating timeline skip markers...');
-      await new Promise(r => setTimeout(r, 250));
 
       setEpisodes(prev => prev.map(ep => {
         if (ep.id !== currentEp.id) return ep;
@@ -1145,11 +1297,11 @@ Output ONLY valid JSON.`;
 
       showToast(
         detectedAds.length > 0
-          ? `Detected ${detectedAds.length} ad segment${detectedAds.length > 1 ? 's' : ''}`
-          : 'Scan complete: no ads flagged in sampled audio'
+          ? `Snapped ${detectedAds.length} ad segment${detectedAds.length > 1 ? 's' : ''} to audio silence pauses`
+          : 'Scan complete: no ads detected in sampled audio'
       );
     } catch (_) {
-      setAudioError('Could not complete Gemini scan. You can still add custom start/end times manually.');
+      setAudioError('Could not complete tri-window scan. You can still add custom start/end times manually.');
     } finally {
       setIsScanning(false);
       setScanStage('');
@@ -1214,10 +1366,10 @@ Output ONLY valid JSON.`;
             <h1 className="font-bold text-base tracking-tight flex items-center gap-2">
               SkipCast
               <span className="text-[10px] font-semibold uppercase px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                v6.3 Dynamic Queue & Scan
+                v6.6 Silence Snapping
               </span>
             </h1>
-            <p className="text-xs text-slate-400">Custom Ad Boundaries & Queue Editor</p>
+            <p className="text-xs text-slate-400">Clean Sentence & Pause Ad Boundaries</p>
           </div>
         </div>
 
@@ -1240,7 +1392,7 @@ Output ONLY valid JSON.`;
             key={tab.id}
             onClick={() => setActiveTab(tab.id)}
             className={`px-3 py-2 text-xs font-semibold border-b-2 whitespace-nowrap transition-colors ${
-              activeTab === tab
+              activeTab === tab.id
                 ? 'border-emerald-400 text-emerald-400'
                 : 'border-transparent text-slate-400 hover:text-slate-200'
             }`}
@@ -1339,7 +1491,7 @@ Output ONLY valid JSON.`;
                 <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-3 space-y-2.5">
                   <span className="text-xs text-amber-200 font-medium flex items-center gap-1.5">
                     <AlertTriangle className="w-4 h-4 text-amber-400" />
-                    Episode ready for Gemini Audio Scan ({formatTime(duration)})
+                    Ready to scan & snap ad boundaries to silence dips ({formatTime(duration)})
                   </span>
                   <button
                     onClick={runAiAdScan}
@@ -1354,7 +1506,7 @@ Output ONLY valid JSON.`;
                     ) : (
                       <>
                         <Sparkles className="w-4 h-4" />
-                        Scan Audio with Gemini 2.5 Flash
+                        Scan & Snap Boundaries with Gemini 2.5 Flash
                       </>
                     )}
                   </button>
@@ -1668,7 +1820,7 @@ Output ONLY valid JSON.`;
                 type="text"
                 value={searchQuery}
                 onChange={e => setSearchQuery(e.target.value)}
-                placeholder="Search e.g. Cults, Darknet Diaries, UnDinamo..."
+                placeholder="Search e.g. Cults, Darknet Diaries..."
                 className="flex-1 bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white"
               />
               <button
@@ -1728,7 +1880,7 @@ Output ONLY valid JSON.`;
           </div>
         )}
 
-        {/* QUEUE EDITOR TAB (MOVE UP / MOVE DOWN / REMOVE / CLEAR OTHERS) */}
+        {/* QUEUE EDITOR TAB */}
         {activeTab === 'episodes' && (
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
             <div className="flex items-center justify-between gap-2 border-b border-slate-800 pb-3">
@@ -1932,7 +2084,7 @@ Output ONLY valid JSON.`;
             </div>
             <div>
               <label className="block text-xs text-slate-400 mb-1">
-                Gemini API Key (Used for Dynamic Audio & Show-Notes Ad Analysis)
+                Gemini API Key (Used for Tri-Window Audio & Show-Notes Ad Analysis)
               </label>
               <input
                 type="password"
