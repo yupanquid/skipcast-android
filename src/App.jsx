@@ -3,7 +3,8 @@ import {
   Play, Pause, FastForward, Rewind, ShieldCheck, Zap, Scissors,
   Volume2, VolumeX, Sparkles, AlertTriangle, RefreshCw,
   Search, Download, CheckCircle2, Trash2, WifiOff, Rss,
-  Plus, Check, FolderUp, FileDown, ArrowLeft, ListPlus, ChevronRight
+  Plus, Check, FolderUp, FileDown, ArrowLeft, ListPlus, ChevronRight,
+  ArrowUp, ArrowDown, ListX
 } from 'lucide-react';
 
 const getNativeMediaSession = () => window.Capacitor?.Plugins?.MediaSession || null;
@@ -22,7 +23,7 @@ const INITIAL_EPISODES = [
     duration: 3600,
     scanned: true,
     ads: [
-      { id: 'ad-demo-1', startTime: 15, endTime: 35, sponsor: 'Test Ad Window (15s-35s)', category: 'Dynamic Pre-Roll', confidence: 0.98, reason: 'Tap "Test Skip" to hear real audio jump over this 20s block', whitelisted: false }
+      { id: 'ad-demo-1', startTime: 15, endTime: 35, sponsor: 'Test Ad Window (15s-35s)', category: 'Manual Test Segment', confidence: 0.98, reason: 'Tap "Test Skip" to verify skip jump on real audio', whitelisted: false }
     ],
     transcript: [
       { start: 0, end: 15, text: "Live MP3 stream connected. Press Play below to verify hardware audio output and Lock Screen Media Tile.", isAd: false },
@@ -142,7 +143,6 @@ const fetchFeedXmlText = async (feedUrl) => {
   return xmlText;
 };
 
-// Helper: Convert ArrayBuffer to base64 for Gemini multimodal inlineData
 const arrayBufferToBase64 = (buffer) => {
   let binary = '';
   const bytes = new Uint8Array(buffer);
@@ -228,6 +228,7 @@ export default function App() {
   const lastSkippedAdRef = useRef(null);
   const activeBlobUrlRef = useRef(null);
   const opmlInputRef = useRef(null);
+  const shouldAutoPlayNextRef = useRef(false);
 
   const currentEp = episodes.find(e => e.id === currentEpId) || episodes[0];
 
@@ -265,6 +266,7 @@ export default function App() {
     getAllOfflineKeys().then(keys => setOfflineIds(keys));
   }, []);
 
+  // Load new episode into HTML5 Audio (preferring offline IndexedDB blob if downloaded)
   useEffect(() => {
     let isCancelled = false;
     const loadAudioSource = async () => {
@@ -292,7 +294,16 @@ export default function App() {
           audioRef.current.src = currentEp.audioUrl || '';
           setPlayingOfflineBlob(false);
         }
-        if (!isCancelled) audioRef.current.load();
+        if (!isCancelled) {
+          audioRef.current.load();
+          if (shouldAutoPlayNextRef.current) {
+            shouldAutoPlayNextRef.current = false;
+            try {
+              await audioRef.current.play();
+              setIsPlaying(true);
+            } catch (_) {}
+          }
+        }
       } catch (_) {
         if (!isCancelled) {
           audioRef.current.src = currentEp.audioUrl || '';
@@ -396,6 +407,17 @@ export default function App() {
       navigator.mediaSession.playbackState = stateStr;
     }
   }, [isPlaying]);
+
+  const handleEpisodeEnded = () => {
+    setIsPlaying(false);
+    const currentIndex = episodes.findIndex(e => e.id === currentEp?.id);
+    if (currentIndex !== -1 && currentIndex + 1 < episodes.length) {
+      const nextEp = episodes[currentIndex + 1];
+      shouldAutoPlayNextRef.current = true;
+      setCurrentEpId(nextEp.id);
+      showToast(`Playing next in queue: ${nextEp.title}`);
+    }
+  };
 
   const triggerSkipChime = () => {
     if (!playChime) return;
@@ -535,6 +557,55 @@ export default function App() {
     }));
   };
 
+  const deleteAdMarker = (adId) => {
+    setEpisodes(prev => prev.map(ep => {
+      if (ep.id !== currentEp.id) return ep;
+      return {
+        ...ep,
+        ads: (ep.ads || []).filter(a => a.id !== adId)
+      };
+    }));
+  };
+
+  // QUEUE EDITING ACTIONS: Move Up, Move Down, Remove Track, Clear Completed/Other Tracks
+  const moveQueueItem = (index, direction, e) => {
+    if (e) e.stopPropagation();
+    const targetIndex = index + direction;
+    if (targetIndex < 0 || targetIndex >= episodes.length) return;
+    setEpisodes(prev => {
+      const copy = [...prev];
+      const [moved] = copy.splice(index, 1);
+      copy.splice(targetIndex, 0, moved);
+      return copy;
+    });
+  };
+
+  const deleteEpisodeFromQueue = (epId, e) => {
+    if (e) e.stopPropagation();
+    if (episodes.length <= 1) {
+      showToast('Keep at least one episode in the queue');
+      return;
+    }
+    deleteEpisodeBlob(epId).catch(() => {});
+    const remaining = episodes.filter(ep => ep.id !== epId);
+    setEpisodes(remaining);
+    if (currentEpId === epId) {
+      setCurrentEpId(remaining[0].id);
+    }
+    showToast('Removed track from queue');
+  };
+
+  const clearOtherQueueTracks = () => {
+    if (!currentEp || episodes.length <= 1) return;
+    episodes.forEach(ep => {
+      if (ep.id !== currentEp.id) {
+        deleteEpisodeBlob(ep.id).catch(() => {});
+      }
+    });
+    setEpisodes([currentEp]);
+    showToast('Cleared other tracks from queue');
+  };
+
   const handleToggleOfflineDownload = async (ep, e) => {
     if (e) e.stopPropagation();
     if (offlineIds.includes(ep.id)) {
@@ -546,7 +617,7 @@ export default function App() {
 
     setEpisodes(prev => {
       if (prev.some(item => item.id === ep.id || item.audioUrl === ep.audioUrl)) return prev;
-      return [ep, ...prev];
+      return [...prev, ep];
     });
 
     setDownloadingId(ep.id);
@@ -577,17 +648,6 @@ export default function App() {
       setAudioError('Offline download blocked by host CORS policy. Streaming playback still works.');
     } finally {
       setDownloadingId(null);
-    }
-  };
-
-  const deleteEpisodeFromQueue = (epId, e) => {
-    if (e) e.stopPropagation();
-    if (episodes.length <= 1) return;
-    deleteEpisodeBlob(epId).catch(() => {});
-    const remaining = episodes.filter(ep => ep.id !== epId);
-    setEpisodes(remaining);
-    if (currentEpId === epId) {
-      setCurrentEpId(remaining[0].id);
     }
   };
 
@@ -704,8 +764,8 @@ export default function App() {
       showToast('Episode is already in your Queue');
       return;
     }
-    setEpisodes(prev => [ep, ...prev]);
-    showToast('Added to Queue');
+    setEpisodes(prev => [...prev, ep]);
+    showToast('Added to end of Queue');
   };
 
   const isSubscribed = (feedUrl) => {
@@ -752,14 +812,6 @@ export default function App() {
           artwork: s.artwork === DEFAULT_ARTWORK ? channelArt : s.artwork,
           episodeCount: parsedEps.length
         } : s));
-
-        if (parsedEps.length > 0) {
-          setEpisodes(prev => {
-            const existingUrls = new Set(prev.map(e => e.audioUrl));
-            const newest = parsedEps.slice(0, 1).filter(e => !existingUrls.has(e.audioUrl));
-            return [...newest, ...prev];
-          });
-        }
       }
     } catch (_) {}
   };
@@ -804,7 +856,7 @@ export default function App() {
     }
 
     if (allNewEpisodes.length > 0) {
-      setEpisodes(prev => [...allNewEpisodes, ...prev]);
+      setEpisodes(prev => [...prev, ...allNewEpisodes]);
     }
 
     const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -967,35 +1019,42 @@ ${outlinesXml}
         { start: 0, end: 30, text: 'Direct audio stream initialized. Press Play below to load full duration.', isAd: false }
       ]
     };
-    setEpisodes(prev => [newEp, ...prev]);
+    setEpisodes(prev => [...prev, newEp]);
     setCurrentEpId(newId);
     setCustomTitle('');
     setCustomAudioUrl('');
     setActiveTab('player');
   };
 
-  // MULTIMODAL AUDIO + GEMINI 2.5 FLASH DETECTION PIPELINE
+  // DYNAMIC GEMINI 2.5 FLASH DETECTION (NO HARDCODED 2-AD OR 0:00 PRE-ROLL ASSUMPTIONS)
   const runAiAdScan = async () => {
     setIsScanning(true);
+    setAudioError(null);
     const epDur = duration > 60 ? duration : (currentEp.duration || 1800);
 
     try {
       let detectedAds = [];
 
-      if (apiKey.trim() && currentEp.audioUrl) {
-        setScanStage('1/3 Sampling first 3.5 mins of real audio for pre-roll analysis...');
+      if (!apiKey.trim()) {
+        setAudioError('Add a Gemini API key in Settings to run real audio/transcript ad detection without hardcoded assumptions. You can also add exact ad start/end seconds manually below.');
+        setEpisodes(prev => prev.map(ep => ep.id === currentEp.id ? { ...ep, scanned: true, ads: ep.ads || [] } : ep));
+        return;
+      }
+
+      if (currentEp.audioUrl) {
+        setScanStage('1/3 Fetching audio segment & show notes for dynamic analysis...');
 
         let audioBase64 = null;
         try {
-          // Fetch the first 2.5MB (~2.5 to 3.5 minutes of 128kbps MP3) using an HTTP Range request
+          // Sample up to ~3.5MB (~3.5-4.5 mins at 128kbps) via range request
           let audioChunkResp = null;
           try {
             audioChunkResp = await fetch(currentEp.audioUrl, {
-              headers: { Range: 'bytes=0-2621440' }
+              headers: { Range: 'bytes=0-3670016' }
             });
           } catch (_) {
             audioChunkResp = await fetch(`https://corsproxy.io/?${encodeURIComponent(currentEp.audioUrl)}`, {
-              headers: { Range: 'bytes=0-2621440' }
+              headers: { Range: 'bytes=0-3670016' }
             });
           }
 
@@ -1007,28 +1066,29 @@ ${outlinesXml}
           }
         } catch (_) {}
 
-        setScanStage('2/3 Running Gemini 2.5 Flash Multimodal Audio & Speech Scan...');
+        setScanStage('2/3 Analyzing audio stream with Gemini 2.5 Flash...');
 
-        const promptText = `You are an expert audio engineer and podcast ad-detection model.
-Analyze this podcast audio sample and show notes (Episode Duration: ${Math.round(epDur)}s, Title: "${currentEp.title}", Notes: "${(currentEp.rawNotes || '').slice(0, 1000)}").
+        const promptText = `You are a precision podcast ad-boundary detector.
+Analyze this podcast episode audio and metadata (Total Episode Duration: ${Math.round(epDur)} seconds, Episode Title: "${currentEp.title}", Show Notes: "${(currentEp.rawNotes || '').slice(0, 1500)}").
 
-Task:
-Listen directly to the audio for:
-1. Dynamic ad insertions, sponsor transition jingles, music stingers, and tone shifts.
-2. Host-read sponsorships, promo code offers, and URL pitches (e.g., "code...", "visit...", "brought to you by", "support for this show comes from").
+Rules:
+- Do NOT assume there are 2 ads or that an ad starts at 0:00 unless you actually hear/find an ad there.
+- Identify ANY number of ads (0, 1, 2, 3, 4, or more) wherever host-read sponsorships, promo codes, sponsor URLs, transition jingles, or dynamically inserted ads occur in the sampled audio or are indicated in the show notes.
+- Return only intervals where startTime < endTime and endTime <= ${Math.round(epDur)}.
+- If no ads are detected in the sampled audio or notes, return an empty JSON array [].
 
-Return a valid JSON array of ad segments with EXACT second boundaries:
+Return a valid JSON array with this structure:
 [
   {
-    "startTime": <number: start timestamp in seconds>,
-    "endTime": <number: end timestamp in seconds>,
-    "sponsor": "<string: brand name or ad type>",
-    "category": "<Host-Read Sponsor | Dynamic Pre-Roll | Mid-Roll Sponsor>",
-    "confidence": <number between 0.80 and 0.99>,
-    "reason": "<short explanation of vocal/acoustic cues observed>"
+    "startTime": <number in seconds>,
+    "endTime": <number in seconds>,
+    "sponsor": "<string: sponsor name or ad type>",
+    "category": "<Host-Read Sponsor | Dynamic Ad | Promo Read | Sponsor Stinger>",
+    "confidence": <number between 0.5 and 0.99>,
+    "reason": "<specific audio or show-notes cue>"
   }
 ]
-If there are no ads in the beginning, check show notes for sponsor timestamps or estimate reasonable mid-roll break points. Output ONLY raw JSON.`;
+Output ONLY valid JSON.`;
 
         const requestParts = [{ text: promptText }];
         if (audioBase64) {
@@ -1054,67 +1114,42 @@ If there are no ads in the beginning, check show notes for sponsor timestamps or
           const rawJson = data?.candidates?.[0]?.content?.parts?.[0]?.text;
           if (rawJson) {
             const parsed = JSON.parse(rawJson);
-            if (Array.isArray(parsed) && parsed.length > 0) {
-              detectedAds = parsed.map((item, i) => ({
-                id: `gemini-audio-${Date.now()}-${i}`,
-                startTime: Math.max(0, Math.round(Number(item.startTime) || 0)),
-                endTime: Math.min(epDur, Math.round(Number(item.endTime) || 30)),
-                sponsor: item.sponsor || 'Sponsor Read',
-                category: item.category || 'Gemini Audio Analysis',
-                confidence: Number(item.confidence) || 0.95,
-                reason: item.reason || 'Detected by Gemini 2.5 Flash Multimodal Audio',
-                whitelisted: false
-              }));
+            if (Array.isArray(parsed)) {
+              detectedAds = parsed
+                .map((item, i) => ({
+                  id: `gemini-audio-${Date.now()}-${i}`,
+                  startTime: Math.max(0, Math.round(Number(item.startTime) || 0)),
+                  endTime: Math.min(Math.round(epDur), Math.round(Number(item.endTime) || 0)),
+                  sponsor: item.sponsor || 'Sponsor Read',
+                  category: item.category || 'Gemini Audio Analysis',
+                  confidence: Number(item.confidence) || 0.9,
+                  reason: item.reason || 'Detected by Gemini 2.5 Flash',
+                  whitelisted: false
+                }))
+                .filter(ad => ad.endTime > ad.startTime)
+                .sort((a, b) => a.startTime - b.startTime);
             }
           }
-        }
-      } else {
-        setScanStage('1/3 Inspecting audio duration & DAI insertion boundaries...');
-        await new Promise(r => setTimeout(r, 600));
-      }
-
-      // Fallback heuristics if API returned 0 ads or key wasn't provided
-      if (detectedAds.length === 0) {
-        const preRollEnd = Math.min(35, Math.round(epDur * 0.04));
-        const midRollStart = Math.round(epDur * 0.48);
-        const midRollEnd = Math.min(epDur - 10, midRollStart + 60);
-
-        detectedAds = [
-          {
-            id: `dai-pre-${Date.now()}`,
-            startTime: 0,
-            endTime: preRollEnd,
-            sponsor: 'Dynamic Pre-Roll Window',
-            category: 'DAI Pre-Roll',
-            confidence: 0.88,
-            reason: `Estimated 0:00-${formatTime(preRollEnd)} insertion window`,
-            whitelisted: false
-          }
-        ];
-        if (epDur > 300) {
-          detectedAds.push({
-            id: `dai-mid-${Date.now()}`,
-            startTime: midRollStart,
-            endTime: midRollEnd,
-            sponsor: 'Mid-Roll Sponsor Break',
-            category: 'DAI Mid-Roll',
-            confidence: 0.85,
-            reason: `Estimated mid-episode commercial break`,
-            whitelisted: false
-          });
+        } else {
+          setAudioError('Gemini API returned an error. Check your API key or quota in Settings.');
         }
       }
 
-      setScanStage('3/3 Snapping boundaries to audio silence & saving skip markers...');
-      await new Promise(r => setTimeout(r, 400));
+      setScanStage('3/3 Updating timeline skip markers...');
+      await new Promise(r => setTimeout(r, 250));
 
       setEpisodes(prev => prev.map(ep => {
         if (ep.id !== currentEp.id) return ep;
         return { ...ep, scanned: true, ads: detectedAds };
       }));
-      showToast(`Detected ${detectedAds.length} ad break${detectedAds.length > 1 ? 's' : ''}!`);
-    } catch (err) {
-      setAudioError('Audio scan finished with fallback DAI boundaries.');
+
+      showToast(
+        detectedAds.length > 0
+          ? `Detected ${detectedAds.length} ad segment${detectedAds.length > 1 ? 's' : ''}`
+          : 'Scan complete: no ads flagged in sampled audio'
+      );
+    } catch (_) {
+      setAudioError('Could not complete Gemini scan. You can still add custom start/end times manually.');
     } finally {
       setIsScanning(false);
       setScanStage('');
@@ -1138,7 +1173,11 @@ If there are no ads in the beginning, check show notes for sponsor timestamps or
     };
     setEpisodes(prev => prev.map(ep => {
       if (ep.id !== currentEp.id) return ep;
-      return { ...ep, scanned: true, ads: [...(ep.ads || []), newAd] };
+      return {
+        ...ep,
+        scanned: true,
+        ads: [...(ep.ads || []), newAd].sort((a, b) => a.startTime - b.startTime)
+      };
     }));
     setManualStart('');
     setManualEnd('');
@@ -1161,7 +1200,7 @@ If there are no ads in the beginning, check show notes for sponsor timestamps or
         onDurationChange={handleLoadedMetadata}
         onPlay={() => setIsPlaying(true)}
         onPause={() => setIsPlaying(false)}
-        onEnded={() => setIsPlaying(false)}
+        onEnded={handleEpisodeEnded}
         onError={() => setAudioError('Stream error: Check connection or use Download Offline.')}
         preload="metadata"
       />
@@ -1175,10 +1214,10 @@ If there are no ads in the beginning, check show notes for sponsor timestamps or
             <h1 className="font-bold text-base tracking-tight flex items-center gap-2">
               SkipCast
               <span className="text-[10px] font-semibold uppercase px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                v6.2 Multimodal AI
+                v6.3 Dynamic Queue & Scan
               </span>
             </h1>
-            <p className="text-xs text-slate-400">Direct Audio Ad Analysis</p>
+            <p className="text-xs text-slate-400">Custom Ad Boundaries & Queue Editor</p>
           </div>
         </div>
 
@@ -1201,7 +1240,7 @@ If there are no ads in the beginning, check show notes for sponsor timestamps or
             key={tab.id}
             onClick={() => setActiveTab(tab.id)}
             className={`px-3 py-2 text-xs font-semibold border-b-2 whitespace-nowrap transition-colors ${
-              activeTab === tab.id
+              activeTab === tab
                 ? 'border-emerald-400 text-emerald-400'
                 : 'border-transparent text-slate-400 hover:text-slate-200'
             }`}
@@ -1300,7 +1339,7 @@ If there are no ads in the beginning, check show notes for sponsor timestamps or
                 <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-3 space-y-2.5">
                   <span className="text-xs text-amber-200 font-medium flex items-center gap-1.5">
                     <AlertTriangle className="w-4 h-4 text-amber-400" />
-                    Episode ready for Multimodal Audio Ad Scan ({formatTime(duration)})
+                    Episode ready for Gemini Audio Scan ({formatTime(duration)})
                   </span>
                   <button
                     onClick={runAiAdScan}
@@ -1328,6 +1367,11 @@ If there are no ads in the beginning, check show notes for sponsor timestamps or
                       Re-Scan Audio
                     </button>
                   </div>
+                  {(currentEp.ads || []).length === 0 && (
+                    <p className="text-xs text-slate-400 bg-slate-950/60 border border-slate-800 rounded-xl p-2.5">
+                      No ad breaks flagged yet. Add a custom range below or re-scan with a Gemini API key.
+                    </p>
+                  )}
                   {currentEp.ads?.map(ad => (
                     <div
                       key={ad.id}
@@ -1354,6 +1398,13 @@ If there are no ads in the beginning, check show notes for sponsor timestamps or
                           className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px]"
                         >
                           {ad.whitelisted ? 'Ignored' : 'Skip'}
+                        </button>
+                        <button
+                          onClick={() => deleteAdMarker(ad.id)}
+                          className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300"
+                          title="Delete marker"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
                         </button>
                       </div>
                     </div>
@@ -1677,15 +1728,30 @@ If there are no ads in the beginning, check show notes for sponsor timestamps or
           </div>
         )}
 
-        {/* EPISODES TAB */}
+        {/* QUEUE EDITOR TAB (MOVE UP / MOVE DOWN / REMOVE / CLEAR OTHERS) */}
         {activeTab === 'episodes' && (
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3">
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-bold text-white">Active Playback Queue ({episodes.length})</h3>
-              <span className="text-[11px] text-slate-400">{offlineIds.length} downloaded offline</span>
+            <div className="flex items-center justify-between gap-2 border-b border-slate-800 pb-3">
+              <div>
+                <h3 className="text-sm font-bold text-white">Playback Queue ({episodes.length})</h3>
+                <p className="text-[11px] text-slate-400 mt-0.5">
+                  Tracks play in order from top to bottom • {offlineIds.length} downloaded offline
+                </p>
+              </div>
+              {episodes.length > 1 && (
+                <button
+                  onClick={clearOtherQueueTracks}
+                  className="px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-rose-500/20 text-slate-300 hover:text-rose-300 border border-slate-700 text-[11px] font-semibold flex items-center gap-1"
+                >
+                  <ListX className="w-3.5 h-3.5" />
+                  Clear Others
+                </button>
+              )}
             </div>
-            {episodes.map(ep => {
+
+            {episodes.map((ep, idx) => {
               const isSaved = offlineIds.includes(ep.id);
+              const isActive = ep.id === currentEp?.id;
               return (
                 <div
                   key={ep.id}
@@ -1694,19 +1760,24 @@ If there are no ads in the beginning, check show notes for sponsor timestamps or
                     setActiveTab('player');
                   }}
                   className={`p-3 rounded-xl border cursor-pointer flex items-center justify-between gap-2 ${
-                    ep.id === currentEp?.id
+                    isActive
                       ? 'bg-emerald-500/10 border-emerald-500/40'
                       : 'bg-slate-950 border-slate-800'
                   }`}
                 >
-                  <div className="flex items-center gap-3 min-w-0">
+                  <div className="flex items-center gap-2.5 min-w-0">
+                    <span className="text-[11px] font-mono text-slate-500 w-5 text-center shrink-0">
+                      {idx + 1}
+                    </span>
                     <img
                       src={ep.artwork || DEFAULT_ARTWORK}
                       alt=""
                       className="w-11 h-11 rounded-lg object-cover shrink-0"
                     />
                     <div className="min-w-0">
-                      <div className="text-xs text-emerald-400 font-medium truncate">{ep.podcast}</div>
+                      <div className="text-xs text-emerald-400 font-medium truncate">
+                        {isActive ? `Playing Now • ${ep.podcast}` : ep.podcast}
+                      </div>
                       <div className="text-sm font-semibold text-white truncate">{ep.title}</div>
                       <div className="text-[11px] text-slate-400 mt-0.5 flex items-center gap-2">
                         <span>{ep.scanned ? `${ep.ads?.length || 0} ads flagged` : 'Tap to scan'}</span>
@@ -1715,10 +1786,26 @@ If there are no ads in the beginning, check show notes for sponsor timestamps or
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-1.5 shrink-0">
+                  <div className="flex items-center gap-1 shrink-0">
+                    <button
+                      onClick={(e) => moveQueueItem(idx, -1, e)}
+                      disabled={idx === 0}
+                      className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-30 text-slate-300"
+                      title="Move up in queue"
+                    >
+                      <ArrowUp className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      onClick={(e) => moveQueueItem(idx, 1, e)}
+                      disabled={idx === episodes.length - 1}
+                      className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-30 text-slate-300"
+                      title="Move down in queue"
+                    >
+                      <ArrowDown className="w-3.5 h-3.5" />
+                    </button>
                     <button
                       onClick={(e) => handleToggleOfflineDownload(ep, e)}
-                      className={`p-2 rounded-lg border ${
+                      className={`p-1.5 rounded-lg border ${
                         isSaved
                           ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300'
                           : 'bg-slate-800 border-slate-700 text-slate-300'
@@ -1726,20 +1813,20 @@ If there are no ads in the beginning, check show notes for sponsor timestamps or
                       title={isSaved ? 'Remove offline download' : 'Download MP3 for offline use'}
                     >
                       {downloadingId === ep.id ? (
-                        <RefreshCw className="w-4 h-4 animate-spin" />
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
                       ) : isSaved ? (
-                        <CheckCircle2 className="w-4 h-4" />
+                        <CheckCircle2 className="w-3.5 h-3.5" />
                       ) : (
-                        <Download className="w-4 h-4" />
+                        <Download className="w-3.5 h-3.5" />
                       )}
                     </button>
                     {episodes.length > 1 && (
                       <button
                         onClick={(e) => deleteEpisodeFromQueue(ep.id, e)}
-                        className="p-2 rounded-lg bg-slate-800/80 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300"
+                        className="p-1.5 rounded-lg bg-slate-800/80 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300"
                         title="Remove from queue"
                       >
-                        <Trash2 className="w-4 h-4" />
+                        <Trash2 className="w-3.5 h-3.5" />
                       </button>
                     )}
                   </div>
@@ -1845,7 +1932,7 @@ If there are no ads in the beginning, check show notes for sponsor timestamps or
             </div>
             <div>
               <label className="block text-xs text-slate-400 mb-1">
-                Gemini API Key (Required for Multimodal Audio Ad Analysis)
+                Gemini API Key (Used for Dynamic Audio & Show-Notes Ad Analysis)
               </label>
               <input
                 type="password"
@@ -1854,9 +1941,6 @@ If there are no ads in the beginning, check show notes for sponsor timestamps or
                 placeholder="AIzaSy..."
                 className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-white"
               />
-              <p className="text-[11px] text-slate-400 mt-1">
-                With a key entered, SkipCast streams audio chunks directly to Gemini 2.5 Flash to listen for vocal pitches, sponsor transitions, and dynamic ad splices.
-              </p>
             </div>
           </div>
         )}
