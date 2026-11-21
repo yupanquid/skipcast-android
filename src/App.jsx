@@ -1132,11 +1132,29 @@ ${outlinesXml}
     setActiveTab('player');
   };
 
-  // FULL-EPISODE SEQUENTIAL SCANNER + SILENCE SNAPPING
+  // FULL-EPISODE SEQUENTIAL SCANNER + NEGATIVE REPORT FILTER + SILENCE SNAPPING
   const runAiAdScan = async () => {
     setIsScanning(true);
     setAudioError(null);
     const epDur = duration > 60 ? duration : (currentEp.duration || 1800);
+
+    const isNegativeReport = (item) => {
+      const name = String(item?.sponsor || '').trim().toLowerCase();
+      const reason = String(item?.reason || '').trim().toLowerCase();
+      if (['null', 'none', 'n/a', 'no ads', 'clean', 'no ad'].includes(name)) return true;
+      if (
+        reason.includes('no sponsor') ||
+        reason.includes('no advertisement') ||
+        reason.includes('no ads') ||
+        reason.includes('contains narrative') ||
+        reason.includes('clean audio')
+      ) {
+        return true;
+      }
+      const span = (Number(item?.endTime) || 0) - (Number(item?.startTime) || 0);
+      if (span > epDur * 0.8) return true;
+      return false;
+    };
 
     try {
       if (!apiKey.trim()) {
@@ -1172,7 +1190,7 @@ ${outlinesXml}
         return { ok: false, error: lastErrMsg };
       };
 
-      const windowBytes = 4200000; // ~4.2 MB per full-scan pass (~4.5 mins at 128kbps)
+      const windowBytes = 4200000;
       const offlineBlob = await getEpisodeBlob(currentEp.id).catch(() => null);
       let fullOfflineBuf = null;
       let totalFileBytes = null;
@@ -1250,7 +1268,8 @@ Full Episode Duration: ${Math.round(epDur)} seconds
 Show Notes: "${(currentEp.rawNotes || 'None provided').slice(0, 1000)}"
 
 This attached audio clip covers approximately ${winStartSec}s to ${winEndSec}s of the episode (clip starts at ~${winStartSec}s).
-Identify any sponsor reads, promo codes, sponsor URLs, transition stingers, or inserted ads heard in this segment.
+Identify ONLY actual sponsor reads, promo codes, sponsor URLs, transition stingers, or inserted ads heard in this segment.
+Do NOT output items when no ads are present in this clip.
 Convert timestamps within this clip into full-episode seconds by adding ~${winStartSec}s so startTime and endTime are in full-episode seconds (0 to ${Math.round(epDur)}).
 Return ONLY a valid JSON array:
 [
@@ -1282,9 +1301,11 @@ Return ONLY a valid JSON array:
             setScanStage(`Snapping boundaries in ${formatTime(winStartSec)} - ${formatTime(winEndSec)} to silence...`);
             for (let i = 0; i < parsed.length; i++) {
               const item = parsed[i];
+              if (isNegativeReport(item)) continue;
+
               let s = Math.max(0, Math.round(Number(item.startTime) || 0));
               let e = Math.min(Math.round(epDur), Math.round(Number(item.endTime) || 0));
-              if (e <= s) continue;
+              if (e <= s || (e - s) < 5) continue;
 
               const snappedStart = await snapToNearestSilence(chunkBuf, s, winStartSec);
               const snappedEnd = await snapToNearestSilence(chunkBuf, e, winStartSec);
@@ -1306,13 +1327,11 @@ Return ONLY a valid JSON array:
         }
 
         startByte += windowBytes;
-        // Brief pause between requests to respect API rate limits
         if (!hitEndOfFile) {
           await new Promise((res) => setTimeout(res, 450));
         }
       }
 
-      // Deduplicate overlapping/duplicate segments across adjacent windows
       const sorted = collectedAds.sort((a, b) => a.startTime - b.startTime);
       const mergedAds = [];
       for (const ad of sorted) {
@@ -1405,7 +1424,7 @@ Return ONLY a valid JSON array:
             <h1 className="font-bold text-base tracking-tight flex items-center gap-2">
               SkipCast
               <span className="text-[10px] font-semibold uppercase px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                v6.8 Full Scan & Scrub
+                v6.9 Clean Ad Filter
               </span>
             </h1>
             <p className="text-xs text-slate-400">Full-Episode Scan & Smooth Timeline Scrubbing</p>
