@@ -1305,10 +1305,8 @@ const geminiResult = await callGeminiWithFallback(requestParts);
             }
           }
         } else {
-          const errJson = await resp.json().catch(() => null);
-          const errMsg = errJson?.error?.message || `HTTP ${resp.status} ${resp.statusText}`;
-          setAudioError(`Gemini Error: ${errMsg}`);
-        }
+  setAudioError(`Gemini Error: ${geminiResult.error}`);
+}
       }
 
       setEpisodes(prev => prev.map(ep => {
