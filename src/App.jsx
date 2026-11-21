@@ -1132,11 +1132,12 @@ ${outlinesXml}
     setActiveTab('player');
   };
 
-  // FULL-EPISODE SEQUENTIAL SCANNER + NEGATIVE REPORT FILTER + SILENCE SNAPPING
+  // FULL-EPISODE DAI-AWARE SCANNER + NEGATIVE REPORT FILTER + SILENCE SNAPPING + RESCAN MERGE
   const runAiAdScan = async () => {
     setIsScanning(true);
     setAudioError(null);
     const epDur = duration > 60 ? duration : (currentEp.duration || 1800);
+    const preservedManualAds = (currentEp.ads || []).filter(a => a.category === 'User Flagged');
 
     const isNegativeReport = (item) => {
       const name = String(item?.sponsor || '').trim().toLowerCase();
@@ -1184,7 +1185,7 @@ ${outlinesXml}
             if (r.status !== 503 && r.status !== 429) {
               return { ok: false, error: lastErrMsg };
             }
-            await new Promise((res) => setTimeout(res, 1200 * (attempt + 1)));
+            await new Promise((res) => setTimeout(res, 1400 * (attempt + 1)));
           }
         }
         return { ok: false, error: lastErrMsg };
@@ -1199,7 +1200,7 @@ ${outlinesXml}
         fullOfflineBuf = await offlineBlob.arrayBuffer();
         totalFileBytes = fullOfflineBuf.byteLength;
       } else if (currentEp.audioUrl) {
-        setScanStage('Checking full episode size...');
+        setScanStage('Checking full episode audio size...');
         const probe = await fetchAudioRange(currentEp.audioUrl, 0, windowBytes - 1);
         if (probe?.totalBytes) totalFileBytes = probe.totalBytes;
       }
@@ -1209,11 +1210,12 @@ ${outlinesXml}
         ? Math.max(1, Math.ceil(totalFileBytes / windowBytes))
         : Math.max(1, Math.ceil((epDur * bytesPerSec) / windowBytes));
 
-      const collectedAds = [];
+      const collectedAds = [...preservedManualAds];
       let startByte = 0;
       let windowIndex = 0;
       let hitEndOfFile = false;
       let anyAudioScanned = false;
+      let failedWindowsCount = 0;
 
       while (!hitEndOfFile && windowIndex < 30) {
         windowIndex++;
@@ -1222,7 +1224,7 @@ ${outlinesXml}
         const winEndSec = Math.min(Math.round(epDur), Math.round(endByte / bytesPerSec));
 
         setScanStage(
-          `Scanning full episode (${windowIndex}/${estimatedTotalWindows}): ${formatTime(winStartSec)} - ${formatTime(winEndSec)}...`
+          `Scanning (${windowIndex}/${estimatedTotalWindows}): ${formatTime(winStartSec)} - ${formatTime(winEndSec)}...`
         );
 
         let chunkBuf = null;
@@ -1262,13 +1264,16 @@ ${outlinesXml}
         anyAudioScanned = true;
         const chunkBase64 = arrayBufferToBase64(chunkBuf);
 
-        const promptText = `You are a precision podcast ad-boundary detector analyzing a sequential segment of a full podcast episode.
+        const promptText = `You are a precision podcast ad and Dynamic Ad Insertion (DAI) boundary detector analyzing a sequential segment of a full podcast episode.
 Episode Title: "${currentEp.title}"
 Full Episode Duration: ${Math.round(epDur)} seconds
 Show Notes: "${(currentEp.rawNotes || 'None provided').slice(0, 1000)}"
 
 This attached audio clip covers approximately ${winStartSec}s to ${winEndSec}s of the episode (clip starts at ~${winStartSec}s).
-Identify ONLY actual sponsor reads, promo codes, sponsor URLs, transition stingers, or inserted ads heard in this segment.
+Watch closely for both host-read sponsorships AND Dynamic Ad Insertion (DAI) / client-side stitched commercials, including:
+- Sudden loudness/compression jumps or mastering shifts between main speech and a commercial break
+- Abrupt room-tone drops, music-bed swaps, or transition stingers/jingles
+- Promo codes, sponsor URLs, or commercial call-to-action phrasing ("use code", "sponsored by", "brought to you by")
 Do NOT output items when no ads are present in this clip.
 Convert timestamps within this clip into full-episode seconds by adding ~${winStartSec}s so startTime and endTime are in full-episode seconds (0 to ${Math.round(epDur)}).
 Return ONLY a valid JSON array:
@@ -1277,9 +1282,9 @@ Return ONLY a valid JSON array:
     "startTime": <number in seconds>,
     "endTime": <number in seconds>,
     "sponsor": "<string>",
-    "category": "<Pre-Roll | Mid-Roll | Late-Roll | Sponsor Read>",
+    "category": "<Pre-Roll | Mid-Roll | Late-Roll | DAI Stitch | Sponsor Read>",
     "confidence": <number 0.5 to 0.99>,
-    "reason": "<brief reason>"
+    "reason": "<brief acoustic/DAI cue>"
   }
 ]`;
 
@@ -1289,46 +1294,50 @@ Return ONLY a valid JSON array:
         ]);
 
         if (!geminiResult.ok) {
-          setAudioError(`Gemini Error: ${geminiResult.error}`);
-          break;
-        }
+          failedWindowsCount++;
+          if (failedWindowsCount >= 2 || !String(geminiResult.error).includes('high demand')) {
+            setAudioError(`Gemini Error: ${geminiResult.error}`);
+            break;
+          }
+          await new Promise((res) => setTimeout(res, 1500));
+        } else {
+          const rawJson = geminiResult.data?.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (rawJson) {
+            const cleaned = rawJson.replace(/```json|```/g, '').trim();
+            const parsed = JSON.parse(cleaned);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              setScanStage(`Snapping boundaries (${formatTime(winStartSec)} - ${formatTime(winEndSec)})...`);
+              for (let i = 0; i < parsed.length; i++) {
+                const item = parsed[i];
+                if (isNegativeReport(item)) continue;
 
-        const rawJson = geminiResult.data?.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (rawJson) {
-          const cleaned = rawJson.replace(/```json|```/g, '').trim();
-          const parsed = JSON.parse(cleaned);
-          if (Array.isArray(parsed) && parsed.length > 0) {
-            setScanStage(`Snapping boundaries in ${formatTime(winStartSec)} - ${formatTime(winEndSec)} to silence...`);
-            for (let i = 0; i < parsed.length; i++) {
-              const item = parsed[i];
-              if (isNegativeReport(item)) continue;
+                let s = Math.max(0, Math.round(Number(item.startTime) || 0));
+                let e = Math.min(Math.round(epDur), Math.round(Number(item.endTime) || 0));
+                if (e <= s || (e - s) < 5) continue;
 
-              let s = Math.max(0, Math.round(Number(item.startTime) || 0));
-              let e = Math.min(Math.round(epDur), Math.round(Number(item.endTime) || 0));
-              if (e <= s || (e - s) < 5) continue;
+                const snappedStart = await snapToNearestSilence(chunkBuf, s, winStartSec);
+                const snappedEnd = await snapToNearestSilence(chunkBuf, e, winStartSec);
+                s = Math.min(snappedStart, snappedEnd - 1);
+                e = Math.max(snappedEnd, s + 1);
 
-              const snappedStart = await snapToNearestSilence(chunkBuf, s, winStartSec);
-              const snappedEnd = await snapToNearestSilence(chunkBuf, e, winStartSec);
-              s = Math.min(snappedStart, snappedEnd - 1);
-              e = Math.max(snappedEnd, s + 1);
-
-              collectedAds.push({
-                id: `gemini-full-${Date.now()}-${windowIndex}-${i}`,
-                startTime: s,
-                endTime: e,
-                sponsor: item.sponsor || 'Sponsor Read',
-                category: item.category || 'Full-Episode AI',
-                confidence: Number(item.confidence) || 0.9,
-                reason: item.reason || `Detected in segment ${formatTime(winStartSec)}-${formatTime(winEndSec)}`,
-                whitelisted: false
-              });
+                collectedAds.push({
+                  id: `gemini-full-${Date.now()}-${windowIndex}-${i}`,
+                  startTime: s,
+                  endTime: e,
+                  sponsor: item.sponsor || 'Sponsor Read',
+                  category: item.category || 'DAI / Full Scan',
+                  confidence: Number(item.confidence) || 0.9,
+                  reason: item.reason || `Detected in segment ${formatTime(winStartSec)}-${formatTime(winEndSec)}`,
+                  whitelisted: false
+                });
+              }
             }
           }
         }
 
         startByte += windowBytes;
         if (!hitEndOfFile) {
-          await new Promise((res) => setTimeout(res, 450));
+          await new Promise((res) => setTimeout(res, 650));
         }
       }
 
@@ -1336,7 +1345,7 @@ Return ONLY a valid JSON array:
       const mergedAds = [];
       for (const ad of sorted) {
         const prev = mergedAds[mergedAds.length - 1];
-        if (prev && Math.abs(ad.startTime - prev.startTime) <= 6 && Math.abs(ad.endTime - prev.endTime) <= 6) {
+        if (prev && Math.abs(ad.startTime - prev.startTime) <= 7 && Math.abs(ad.endTime - prev.endTime) <= 7) {
           prev.startTime = Math.min(prev.startTime, ad.startTime);
           prev.endTime = Math.max(prev.endTime, ad.endTime);
         } else {
@@ -1352,12 +1361,12 @@ Return ONLY a valid JSON array:
       if (!anyAudioScanned) {
         showToast('Could not read audio stream (try Download Offline first)');
       } else if (mergedAds.length > 0) {
-        showToast(`Full scan complete (${windowIndex} segments): found ${mergedAds.length} ad break${mergedAds.length > 1 ? 's' : ''}`);
+        showToast(`Scan complete (${windowIndex} windows): ${mergedAds.length} ad segment${mergedAds.length > 1 ? 's' : ''} ready`);
       } else {
-        showToast(`Full scan complete (${windowIndex} segments checked): 0 ads flagged`);
+        showToast(`Scan complete (${windowIndex} windows checked): 0 ads flagged`);
       }
     } catch (_) {
-      setAudioError('Full-episode scan interrupted. You can still add custom start/end times manually.');
+      setAudioError('Full-episode scan interrupted. Your existing markers and manual ranges were kept.');
     } finally {
       setIsScanning(false);
       setScanStage('');
@@ -1424,10 +1433,10 @@ Return ONLY a valid JSON array:
             <h1 className="font-bold text-base tracking-tight flex items-center gap-2">
               SkipCast
               <span className="text-[10px] font-semibold uppercase px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                v6.9 Clean Ad Filter
+                v6.10 DAI & Rescan
               </span>
             </h1>
-            <p className="text-xs text-slate-400">Full-Episode Scan & Smooth Timeline Scrubbing</p>
+            <p className="text-xs text-slate-400">DAI Ad Detection, Full Scan & Smooth Scrubbing</p>
           </div>
         </div>
 
@@ -1549,7 +1558,7 @@ Return ONLY a valid JSON array:
                 <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-3 space-y-2.5">
                   <span className="text-xs text-amber-200 font-medium flex items-center gap-1.5">
                     <AlertTriangle className="w-4 h-4 text-amber-400" />
-                    Full-episode scan checks every segment from start to finish ({formatTime(duration)})
+                    Full-episode scan checks every segment for DAI stitches & ads ({formatTime(duration)})
                   </span>
                   <button
                     onClick={runAiAdScan}
@@ -1573,8 +1582,13 @@ Return ONLY a valid JSON array:
                 <div className="space-y-2">
                   <div className="text-xs font-semibold text-slate-400 flex items-center justify-between">
                     <span>Detected Ad Segments ({currentEp.ads?.length || 0})</span>
-                    <button onClick={runAiAdScan} className="text-[11px] text-emerald-400 underline">
-                      Re-Scan Full Episode
+                    <button
+                      onClick={runAiAdScan}
+                      disabled={isScanning}
+                      className="text-[11px] text-emerald-400 underline flex items-center gap-1"
+                    >
+                      {isScanning ? <RefreshCw className="w-3 h-3 animate-spin" /> : null}
+                      {isScanning ? (scanStage || 'Scanning...') : 'Re-Scan Full Episode'}
                     </button>
                   </div>
                   {(currentEp.ads || []).length === 0 && (
