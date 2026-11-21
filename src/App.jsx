@@ -1216,17 +1216,36 @@ Output ONLY valid JSON.`;
         if (midChunkBase64) requestParts.push({ inlineData: { mimeType: 'audio/mp3', data: midChunkBase64 } });
         if (lateChunkBase64) requestParts.push({ inlineData: { mimeType: 'audio/mp3', data: lateChunkBase64 } });
 
-        const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${apiKey.trim()}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            contents: [{ parts: requestParts }],
-            generationConfig: { responseMimeType: 'application/json' }
-          })
-        });
+        const callGeminiWithFallback = async (parts) => {
+  const models = ['gemini-3.8-flash', 'gemini-3.5-flash-lite'];
+  let lastErrMsg = '';
+  for (const model of models) {
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey.trim()}`;
+    const body = JSON.stringify({
+      contents: [{ parts }],
+      generationConfig: { responseMimeType: 'application/json' }
+    });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const r = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body
+      });
+      if (r.ok) return { ok: true, data: await r.json() };
+      const errJson = await r.json().catch(() => null);
+      lastErrMsg = errJson?.error?.message || `HTTP ${r.status} ${r.statusText}`;
+      if (r.status !== 503 && r.status !== 429) {
+        return { ok: false, error: lastErrMsg };
+      }
+      await new Promise((res) => setTimeout(res, 1200 * (attempt + 1)));
+    }
+  }
+  return { ok: false, error: lastErrMsg };
+};
+const geminiResult = await callGeminiWithFallback(requestParts);
 
-        if (resp.ok) {
-          const data = await resp.json();
+        if (geminiResult.ok) {
+  const data = geminiResult.data;
           const rawJson = data?.candidates?.[0]?.content?.parts?.[0]?.text;
           if (rawJson) {
             const parsed = JSON.parse(rawJson);
