@@ -162,7 +162,6 @@ const isLikelyHtml = (buffer) => {
   }
 };
 
-// Fetch a byte range directly or via CORS proxy, rejecting HTML error pages
 const fetchAudioRange = async (audioUrl, startByte, endByte) => {
   const headers = { Range: `bytes=${startByte}-${endByte}` };
   for (const candidateUrl of [audioUrl, `https://corsproxy.io/?${encodeURIComponent(audioUrl)}`]) {
@@ -176,7 +175,7 @@ const fetchAudioRange = async (audioUrl, startByte, endByte) => {
           if (!isNaN(parsedTotal) && parsedTotal > 0) totalBytes = parsedTotal;
         }
         const buffer = await r.arrayBuffer();
-        if (buffer && buffer.byteLength > 50000 && !isLikelyHtml(buffer)) {
+        if (buffer && buffer.byteLength > 25000 && !isLikelyHtml(buffer)) {
           return { buffer, totalBytes };
         }
       }
@@ -265,6 +264,7 @@ export default function App() {
 
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
+  const [scrubTime, setScrubTime] = useState(null);
   const [duration, setDuration] = useState(1800);
   const [isMuted, setIsMuted] = useState(false);
   const [audioError, setAudioError] = useState(null);
@@ -307,6 +307,8 @@ export default function App() {
   const activeBlobUrlRef = useRef(null);
   const opmlInputRef = useRef(null);
   const shouldAutoPlayNextRef = useRef(false);
+  const progressBarRef = useRef(null);
+  const isDraggingRef = useRef(false);
 
   const currentEp = episodes.find(e => e.id === currentEpId) || episodes[0];
 
@@ -352,6 +354,7 @@ export default function App() {
       audioRef.current.pause();
       setIsPlaying(false);
       setCurrentTime(0);
+      setScrubTime(null);
       setDuration(currentEp.duration || 1800);
       lastSkippedAdRef.current = null;
 
@@ -519,7 +522,7 @@ export default function App() {
 
   const handleTimeUpdate = () => {
     const audio = audioRef.current;
-    if (!audio) return;
+    if (!audio || isDraggingRef.current) return;
     const now = audio.currentTime;
     setCurrentTime(now);
 
@@ -591,6 +594,33 @@ export default function App() {
     lastSkippedAdRef.current = null;
     if (audio) audio.currentTime = clamped;
     setCurrentTime(clamped);
+  };
+
+  const getTimeFromClientX = (clientX) => {
+    const bar = progressBarRef.current;
+    if (!bar) return 0;
+    const rect = bar.getBoundingClientRect();
+    const pct = Math.max(0, Math.min(1, (clientX - rect.left) / Math.max(1, rect.width)));
+    return pct * (duration || 1);
+  };
+
+  const handleScrubStart = (e) => {
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+    isDraggingRef.current = true;
+    setScrubTime(getTimeFromClientX(e.clientX));
+  };
+
+  const handleScrubMove = (e) => {
+    if (!isDraggingRef.current) return;
+    setScrubTime(getTimeFromClientX(e.clientX));
+  };
+
+  const handleScrubEnd = (e) => {
+    if (!isDraggingRef.current) return;
+    isDraggingRef.current = false;
+    const target = getTimeFromClientX(e.clientX);
+    setScrubTime(null);
+    seekTo(target);
   };
 
   const formatTime = (sec) => {
@@ -1102,120 +1132,18 @@ ${outlinesXml}
     setActiveTab('player');
   };
 
-  // TRI-WINDOW GEMINI AUDIO SCANNER (0%, 35%, 70%) + OFFLINE BLOB FALLBACK + SILENCE SNAPPING
+  // FULL-EPISODE SEQUENTIAL SCANNER + SILENCE SNAPPING
   const runAiAdScan = async () => {
     setIsScanning(true);
     setAudioError(null);
     const epDur = duration > 60 ? duration : (currentEp.duration || 1800);
 
     try {
-      let detectedAds = [];
-
       if (!apiKey.trim()) {
-        setAudioError('Add a Gemini API key in Settings to run audio ad detection. You can also add custom start/end seconds manually below.');
+        setAudioError('Add a Gemini API key in Settings to run full-episode ad detection. You can also add custom start/end seconds manually below.');
         setEpisodes(prev => prev.map(ep => ep.id === currentEp.id ? { ...ep, scanned: true, ads: ep.ads || [] } : ep));
         return;
       }
-
-      const chunkBytes = 2400000; // ~2.4 MB per slice (~2.5 mins at 128kbps)
-      let startBuffer = null;
-      let midBuffer = null;
-      let lateBuffer = null;
-      let midStartSec = Math.round(epDur * 0.35);
-      let lateStartSec = Math.round(epDur * 0.70);
-      let attachedAudioCount = 0;
-
-      // Prefer offline downloaded audio if available, otherwise fetch remote byte ranges
-      const offlineBlob = await getEpisodeBlob(currentEp.id).catch(() => null);
-
-      if (offlineBlob && offlineBlob.size > 50000) {
-        setScanStage('1/5 Reading saved offline audio windows...');
-        const fullBuf = await offlineBlob.arrayBuffer();
-        const totalSize = fullBuf.byteLength;
-        const estBps = totalSize / epDur;
-
-        startBuffer = fullBuf.slice(0, Math.min(totalSize, chunkBytes));
-
-        if (epDur > 180) {
-          const midStartByte = Math.min(totalSize - 1024, Math.max(chunkBytes, Math.round(epDur * 0.35 * estBps)));
-          midStartSec = Math.max(20, Math.round(midStartByte / estBps));
-          midBuffer = fullBuf.slice(midStartByte, Math.min(totalSize, midStartByte + chunkBytes));
-        }
-
-        if (epDur > 300) {
-          const lateStartByte = Math.min(totalSize - 1024, Math.max(chunkBytes * 2, Math.round(epDur * 0.70 * estBps)));
-          lateStartSec = Math.max(midStartSec + 45, Math.round(lateStartByte / estBps));
-          lateBuffer = fullBuf.slice(lateStartByte, Math.min(totalSize, lateStartByte + chunkBytes));
-        }
-      } else if (currentEp.audioUrl) {
-        setScanStage('1/5 Sampling opening audio chunk (0%)...');
-        const startRange = await fetchAudioRange(currentEp.audioUrl, 0, chunkBytes - 1);
-        if (startRange?.buffer) {
-          startBuffer = startRange.buffer;
-        }
-
-        const estimatedBytesPerSec = startRange?.totalBytes
-          ? startRange.totalBytes / epDur
-          : 16000;
-
-        if (epDur > 180) {
-          setScanStage('2/5 Sampling mid-episode audio chunk (~35%)...');
-          const midStartByte = Math.max(chunkBytes + 32768, Math.round(epDur * 0.35 * estimatedBytesPerSec));
-          midStartSec = Math.max(20, Math.round(midStartByte / estimatedBytesPerSec));
-          const midRange = await fetchAudioRange(currentEp.audioUrl, midStartByte, midStartByte + chunkBytes - 1);
-          if (midRange?.buffer) {
-            midBuffer = midRange.buffer;
-          }
-        }
-
-        if (epDur > 300) {
-          setScanStage('3/5 Sampling late-roll audio chunk (~70%)...');
-          const lateStartByte = Math.max(chunkBytes * 2 + 65536, Math.round(epDur * 0.70 * estimatedBytesPerSec));
-          lateStartSec = Math.max(midStartSec + 45, Math.round(lateStartByte / estimatedBytesPerSec));
-          const lateRange = await fetchAudioRange(currentEp.audioUrl, lateStartByte, lateStartByte + chunkBytes - 1);
-          if (lateRange?.buffer) {
-            lateBuffer = lateRange.buffer;
-          }
-        }
-      }
-
-      setScanStage('4/5 Analyzing audio & show notes with Gemini...');
-
-      const startChunkBase64 = startBuffer?.byteLength > 50000 ? arrayBufferToBase64(startBuffer) : null;
-      const midChunkBase64 = midBuffer?.byteLength > 50000 ? arrayBufferToBase64(midBuffer) : null;
-      const lateChunkBase64 = lateBuffer?.byteLength > 50000 ? arrayBufferToBase64(lateBuffer) : null;
-
-      if (startChunkBase64) attachedAudioCount++;
-      if (midChunkBase64) attachedAudioCount++;
-      if (lateChunkBase64) attachedAudioCount++;
-
-      const promptText = `You are a podcast ad-boundary detector analyzing a podcast episode (${currentEp.title}, duration: ${Math.round(epDur)}s).
-Show notes: "${(currentEp.rawNotes || 'None provided').slice(0, 1500)}"
-
-Audio context:
-- Clip 1 (if attached): starts around 0s.
-${midChunkBase64 ? `- Clip 2 (if attached): starts around ${midStartSec}s.` : ''}
-${lateChunkBase64 ? `- Clip 3 (if attached): starts around ${lateStartSec}s.` : ''}
-${attachedAudioCount === 0 ? '- Note: Remote audio chunks could not be streamed directly; rely on show notes and standard podcast sponsorship patterns if mentioned.' : ''}
-
-Identify sponsor reads, promo codes, sponsor URLs, ad stingers, or dynamic ad breaks across the episode.
-Convert Clip 2 timestamps by adding ~${midStartSec}s and Clip 3 timestamps by adding ~${lateStartSec}s so startTime and endTime are in full-episode seconds (0 to ${Math.round(epDur)}).
-Return ONLY a valid JSON array:
-[
-  {
-    "startTime": <number in seconds>,
-    "endTime": <number in seconds>,
-    "sponsor": "<string>",
-    "category": "<Pre-Roll | Mid-Roll | Late-Roll | Sponsor Read>",
-    "confidence": <number 0.5 to 0.99>,
-    "reason": "<brief reason>"
-  }
-]`;
-
-      const requestParts = [{ text: promptText }];
-      if (startChunkBase64) requestParts.push({ inlineData: { mimeType: 'audio/mp3', data: startChunkBase64 } });
-      if (midChunkBase64) requestParts.push({ inlineData: { mimeType: 'audio/mp3', data: midChunkBase64 } });
-      if (lateChunkBase64) requestParts.push({ inlineData: { mimeType: 'audio/mp3', data: lateChunkBase64 } });
 
       const callGeminiWithFallback = async (parts) => {
         const models = ['gemini-3.8-flash', 'gemini-3.5-flash-lite'];
@@ -1244,62 +1172,173 @@ Return ONLY a valid JSON array:
         return { ok: false, error: lastErrMsg };
       };
 
-      const geminiResult = await callGeminiWithFallback(requestParts);
-      if (geminiResult.ok) {
+      const windowBytes = 4200000; // ~4.2 MB per full-scan pass (~4.5 mins at 128kbps)
+      const offlineBlob = await getEpisodeBlob(currentEp.id).catch(() => null);
+      let fullOfflineBuf = null;
+      let totalFileBytes = null;
+
+      if (offlineBlob && offlineBlob.size > 25000) {
+        fullOfflineBuf = await offlineBlob.arrayBuffer();
+        totalFileBytes = fullOfflineBuf.byteLength;
+      } else if (currentEp.audioUrl) {
+        setScanStage('Checking full episode size...');
+        const probe = await fetchAudioRange(currentEp.audioUrl, 0, windowBytes - 1);
+        if (probe?.totalBytes) totalFileBytes = probe.totalBytes;
+      }
+
+      const bytesPerSec = totalFileBytes && epDur > 0 ? totalFileBytes / epDur : 16000;
+      const estimatedTotalWindows = totalFileBytes
+        ? Math.max(1, Math.ceil(totalFileBytes / windowBytes))
+        : Math.max(1, Math.ceil((epDur * bytesPerSec) / windowBytes));
+
+      const collectedAds = [];
+      let startByte = 0;
+      let windowIndex = 0;
+      let hitEndOfFile = false;
+      let anyAudioScanned = false;
+
+      while (!hitEndOfFile && windowIndex < 30) {
+        windowIndex++;
+        const endByte = startByte + windowBytes - 1;
+        const winStartSec = Math.round(startByte / bytesPerSec);
+        const winEndSec = Math.min(Math.round(epDur), Math.round(endByte / bytesPerSec));
+
+        setScanStage(
+          `Scanning full episode (${windowIndex}/${estimatedTotalWindows}): ${formatTime(winStartSec)} - ${formatTime(winEndSec)}...`
+        );
+
+        let chunkBuf = null;
+        if (fullOfflineBuf) {
+          if (startByte >= fullOfflineBuf.byteLength) {
+            hitEndOfFile = true;
+            break;
+          }
+          chunkBuf = fullOfflineBuf.slice(startByte, Math.min(fullOfflineBuf.byteLength, endByte + 1));
+          if (startByte + chunkBuf.byteLength >= fullOfflineBuf.byteLength) {
+            hitEndOfFile = true;
+          }
+        } else if (currentEp.audioUrl) {
+          const rangeRes = await fetchAudioRange(currentEp.audioUrl, startByte, endByte);
+          if (rangeRes?.buffer) {
+            chunkBuf = rangeRes.buffer;
+            if (rangeRes.totalBytes) {
+              totalFileBytes = rangeRes.totalBytes;
+              if (endByte + 1 >= rangeRes.totalBytes) hitEndOfFile = true;
+            }
+            if (chunkBuf.byteLength < windowBytes * 0.65) {
+              hitEndOfFile = true;
+            }
+          } else {
+            hitEndOfFile = true;
+            break;
+          }
+        } else {
+          break;
+        }
+
+        if (!chunkBuf || chunkBuf.byteLength <= 25000) {
+          hitEndOfFile = true;
+          break;
+        }
+
+        anyAudioScanned = true;
+        const chunkBase64 = arrayBufferToBase64(chunkBuf);
+
+        const promptText = `You are a precision podcast ad-boundary detector analyzing a sequential segment of a full podcast episode.
+Episode Title: "${currentEp.title}"
+Full Episode Duration: ${Math.round(epDur)} seconds
+Show Notes: "${(currentEp.rawNotes || 'None provided').slice(0, 1000)}"
+
+This attached audio clip covers approximately ${winStartSec}s to ${winEndSec}s of the episode (clip starts at ~${winStartSec}s).
+Identify any sponsor reads, promo codes, sponsor URLs, transition stingers, or inserted ads heard in this segment.
+Convert timestamps within this clip into full-episode seconds by adding ~${winStartSec}s so startTime and endTime are in full-episode seconds (0 to ${Math.round(epDur)}).
+Return ONLY a valid JSON array:
+[
+  {
+    "startTime": <number in seconds>,
+    "endTime": <number in seconds>,
+    "sponsor": "<string>",
+    "category": "<Pre-Roll | Mid-Roll | Late-Roll | Sponsor Read>",
+    "confidence": <number 0.5 to 0.99>,
+    "reason": "<brief reason>"
+  }
+]`;
+
+        const geminiResult = await callGeminiWithFallback([
+          { text: promptText },
+          { inlineData: { mimeType: 'audio/mp3', data: chunkBase64 } }
+        ]);
+
+        if (!geminiResult.ok) {
+          setAudioError(`Gemini Error: ${geminiResult.error}`);
+          break;
+        }
+
         const rawJson = geminiResult.data?.candidates?.[0]?.content?.parts?.[0]?.text;
         if (rawJson) {
           const cleaned = rawJson.replace(/```json|```/g, '').trim();
           const parsed = JSON.parse(cleaned);
           if (Array.isArray(parsed) && parsed.length > 0) {
-            setScanStage('5/5 Snapping ad boundaries to acoustic silence dips...');
+            setScanStage(`Snapping boundaries in ${formatTime(winStartSec)} - ${formatTime(winEndSec)} to silence...`);
+            for (let i = 0; i < parsed.length; i++) {
+              const item = parsed[i];
+              let s = Math.max(0, Math.round(Number(item.startTime) || 0));
+              let e = Math.min(Math.round(epDur), Math.round(Number(item.endTime) || 0));
+              if (e <= s) continue;
 
-            const rawAds = parsed
-              .map((item, i) => ({
-                id: `gemini-audio-${Date.now()}-${i}`,
-                startTime: Math.max(0, Math.round(Number(item.startTime) || 0)),
-                endTime: Math.min(Math.round(epDur), Math.round(Number(item.endTime) || 0)),
+              const snappedStart = await snapToNearestSilence(chunkBuf, s, winStartSec);
+              const snappedEnd = await snapToNearestSilence(chunkBuf, e, winStartSec);
+              s = Math.min(snappedStart, snappedEnd - 1);
+              e = Math.max(snappedEnd, s + 1);
+
+              collectedAds.push({
+                id: `gemini-full-${Date.now()}-${windowIndex}-${i}`,
+                startTime: s,
+                endTime: e,
                 sponsor: item.sponsor || 'Sponsor Read',
-                category: item.category || 'Gemini Audio AI',
+                category: item.category || 'Full-Episode AI',
                 confidence: Number(item.confidence) || 0.9,
-                reason: item.reason || 'Detected by Gemini',
+                reason: item.reason || `Detected in segment ${formatTime(winStartSec)}-${formatTime(winEndSec)}`,
                 whitelisted: false
-              }))
-              .filter(ad => ad.endTime > ad.startTime);
-
-            for (const ad of rawAds) {
-              const startBuf = ad.startTime < midStartSec ? startBuffer : (ad.startTime < lateStartSec ? midBuffer : lateBuffer);
-              const startOff = ad.startTime < midStartSec ? 0 : (ad.startTime < lateStartSec ? midStartSec : lateStartSec);
-              const endBuf = ad.endTime < midStartSec ? startBuffer : (ad.endTime < lateStartSec ? midBuffer : lateBuffer);
-              const endOff = ad.endTime < midStartSec ? 0 : (ad.endTime < lateStartSec ? midStartSec : lateStartSec);
-
-              const snappedStart = await snapToNearestSilence(startBuf, ad.startTime, startOff);
-              const snappedEnd = await snapToNearestSilence(endBuf, ad.endTime, endOff);
-
-              ad.startTime = Math.min(snappedStart, ad.endTime - 1);
-              ad.endTime = Math.max(snappedEnd, ad.startTime + 1);
+              });
             }
-
-            detectedAds = rawAds.sort((a, b) => a.startTime - b.startTime);
           }
         }
-      } else {
-        setAudioError(`Gemini Error: ${geminiResult.error}`);
+
+        startByte += windowBytes;
+        // Brief pause between requests to respect API rate limits
+        if (!hitEndOfFile) {
+          await new Promise((res) => setTimeout(res, 450));
+        }
+      }
+
+      // Deduplicate overlapping/duplicate segments across adjacent windows
+      const sorted = collectedAds.sort((a, b) => a.startTime - b.startTime);
+      const mergedAds = [];
+      for (const ad of sorted) {
+        const prev = mergedAds[mergedAds.length - 1];
+        if (prev && Math.abs(ad.startTime - prev.startTime) <= 6 && Math.abs(ad.endTime - prev.endTime) <= 6) {
+          prev.startTime = Math.min(prev.startTime, ad.startTime);
+          prev.endTime = Math.max(prev.endTime, ad.endTime);
+        } else {
+          mergedAds.push(ad);
+        }
       }
 
       setEpisodes(prev => prev.map(ep => {
         if (ep.id !== currentEp.id) return ep;
-        return { ...ep, scanned: true, ads: detectedAds };
+        return { ...ep, scanned: true, ads: mergedAds };
       }));
 
-      if (detectedAds.length > 0) {
-        showToast(`Found ${detectedAds.length} ad segment${detectedAds.length > 1 ? 's' : ''} (${attachedAudioCount} audio clip${attachedAudioCount === 1 ? '' : 's'} scanned)`);
-      } else if (attachedAudioCount === 0) {
-        showToast('No ads found (host blocked audio slices — try Download Offline first)');
+      if (!anyAudioScanned) {
+        showToast('Could not read audio stream (try Download Offline first)');
+      } else if (mergedAds.length > 0) {
+        showToast(`Full scan complete (${windowIndex} segments): found ${mergedAds.length} ad break${mergedAds.length > 1 ? 's' : ''}`);
       } else {
-        showToast(`Scan complete (${attachedAudioCount} audio clip${attachedAudioCount === 1 ? '' : 's'} checked): 0 ads flagged`);
+        showToast(`Full scan complete (${windowIndex} segments checked): 0 ads flagged`);
       }
     } catch (_) {
-      setAudioError('Could not complete audio scan. You can still add custom start/end times manually.');
+      setAudioError('Full-episode scan interrupted. You can still add custom start/end times manually.');
     } finally {
       setIsScanning(false);
       setScanStage('');
@@ -1341,6 +1380,8 @@ Return ONLY a valid JSON array:
     (ep.rawNotes && ep.rawNotes.toLowerCase().includes(episodeFilterQuery.toLowerCase()))
   );
 
+  const displayedTime = scrubTime !== null ? scrubTime : currentTime;
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col pb-32">
       <audio
@@ -1364,10 +1405,10 @@ Return ONLY a valid JSON array:
             <h1 className="font-bold text-base tracking-tight flex items-center gap-2">
               SkipCast
               <span className="text-[10px] font-semibold uppercase px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                v6.7 Smart Audio Scan
+                v6.8 Full Scan & Scrub
               </span>
             </h1>
-            <p className="text-xs text-slate-400">Multi-Window Scan & Silence Snapping</p>
+            <p className="text-xs text-slate-400">Full-Episode Scan & Smooth Timeline Scrubbing</p>
           </div>
         </div>
 
@@ -1489,7 +1530,7 @@ Return ONLY a valid JSON array:
                 <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-3 space-y-2.5">
                   <span className="text-xs text-amber-200 font-medium flex items-center gap-1.5">
                     <AlertTriangle className="w-4 h-4 text-amber-400" />
-                    Ready to scan & snap ad boundaries to silence dips ({formatTime(duration)})
+                    Full-episode scan checks every segment from start to finish ({formatTime(duration)})
                   </span>
                   <button
                     onClick={runAiAdScan}
@@ -1504,7 +1545,7 @@ Return ONLY a valid JSON array:
                     ) : (
                       <>
                         <Sparkles className="w-4 h-4" />
-                        Scan & Snap Boundaries with Gemini
+                        Scan Full Episode with Gemini
                       </>
                     )}
                   </button>
@@ -1514,12 +1555,12 @@ Return ONLY a valid JSON array:
                   <div className="text-xs font-semibold text-slate-400 flex items-center justify-between">
                     <span>Detected Ad Segments ({currentEp.ads?.length || 0})</span>
                     <button onClick={runAiAdScan} className="text-[11px] text-emerald-400 underline">
-                      Re-Scan Audio
+                      Re-Scan Full Episode
                     </button>
                   </div>
                   {(currentEp.ads || []).length === 0 && (
                     <p className="text-xs text-slate-400 bg-slate-950/60 border border-slate-800 rounded-xl p-2.5">
-                      No ad breaks flagged yet. Add a custom range below, download offline for local audio scanning, or tap Re-Scan Audio.
+                      No ad breaks flagged yet. Add a custom range below, download offline for local scanning, or re-scan.
                     </p>
                   )}
                   {currentEp.ads?.map(ad => (
@@ -2082,7 +2123,7 @@ Return ONLY a valid JSON array:
             </div>
             <div>
               <label className="block text-xs text-slate-400 mb-1">
-                Gemini API Key (Used for Tri-Window Audio & Show-Notes Ad Analysis)
+                Gemini API Key (Used for Full-Episode Ad Analysis)
               </label>
               <input
                 type="password"
@@ -2096,38 +2137,46 @@ Return ONLY a valid JSON array:
         )}
       </main>
 
-      {/* Sticky Player Bar */}
+      {/* Sticky Player Bar with Smooth Drag Scrubbing */}
       <div className="fixed bottom-0 left-0 right-0 bg-slate-900/95 backdrop-blur border-t border-slate-800 p-3 z-30">
         <div className="max-w-3xl mx-auto space-y-2">
           <div
-            className="relative h-3 bg-slate-800 rounded-full overflow-hidden cursor-pointer"
-            onClick={(e) => {
-              const rect = e.currentTarget.getBoundingClientRect();
-              const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-              seekTo(pct * (duration || 1));
-            }}
+            ref={progressBarRef}
+            onPointerDown={handleScrubStart}
+            onPointerMove={handleScrubMove}
+            onPointerUp={handleScrubEnd}
+            onPointerCancel={handleScrubEnd}
+            className="relative h-5 flex items-center cursor-pointer touch-none select-none"
           >
+            <div className="relative w-full h-3 bg-slate-800 rounded-full overflow-hidden">
+              <div
+                className="absolute top-0 left-0 bottom-0 bg-emerald-500"
+                style={{ width: `${Math.min(100, (displayedTime / (duration || 1)) * 100)}%` }}
+              />
+              {currentEp?.scanned &&
+                currentEp.ads?.map(ad => (
+                  <div
+                    key={ad.id}
+                    style={{
+                      left: `${Math.min(100, (ad.startTime / (duration || 1)) * 100)}%`,
+                      width: `${Math.max(1, ((ad.endTime - ad.startTime) / (duration || 1)) * 100)}%`
+                    }}
+                    className={`absolute top-0 bottom-0 ${
+                      ad.whitelisted ? 'bg-slate-500/50' : 'bg-amber-500/90'
+                    }`}
+                  />
+                ))}
+            </div>
             <div
-              className="absolute top-0 left-0 bottom-0 bg-emerald-500 transition-all"
-              style={{ width: `${Math.min(100, (currentTime / (duration || 1)) * 100)}%` }}
+              className="absolute w-3.5 h-3.5 rounded-full bg-white border-2 border-emerald-400 shadow -translate-x-1/2 pointer-events-none"
+              style={{ left: `${Math.min(100, (displayedTime / (duration || 1)) * 100)}%` }}
             />
-            {currentEp?.scanned &&
-              currentEp.ads?.map(ad => (
-                <div
-                  key={ad.id}
-                  style={{
-                    left: `${Math.min(100, (ad.startTime / (duration || 1)) * 100)}%`,
-                    width: `${Math.max(1, ((ad.endTime - ad.startTime) / (duration || 1)) * 100)}%`
-                  }}
-                  className={`absolute top-0 bottom-0 ${
-                    ad.whitelisted ? 'bg-slate-500/50' : 'bg-amber-500/90'
-                  }`}
-                />
-              ))}
           </div>
 
           <div className="flex items-center justify-between text-xs">
-            <span className="font-mono text-slate-400">{formatTime(currentTime)}</span>
+            <span className={`font-mono ${scrubTime !== null ? 'text-emerald-400 font-bold' : 'text-slate-400'}`}>
+              {formatTime(displayedTime)}
+            </span>
             <div className="flex items-center gap-4">
               <button onClick={() => seekTo(currentTime - 15)} className="p-1.5 text-slate-300 hover:text-white">
                 <Rewind className="w-4 h-4" />
