@@ -4,12 +4,14 @@ import {
   Volume2, VolumeX, Sparkles, AlertTriangle, RefreshCw,
   Search, Download, CheckCircle2, Trash2, WifiOff, Rss,
   Plus, Check, FolderUp, FileDown, ArrowLeft, ListPlus, ChevronRight,
-  ArrowUp, ArrowDown, ListX
+  ArrowUp, ArrowDown, ListX, XCircle
 } from 'lucide-react';
 
 const getNativeMediaSession = () => window.Capacitor?.Plugins?.MediaSession || null;
 
 const DEFAULT_ARTWORK = 'https://images.unsplash.com/photo-1590602847861-f357a9332bbc?w=512&q=80';
+
+const PLAYBACK_SPEEDS = [1, 1.2, 1.5, 2];
 
 const INITIAL_EPISODES = [
   {
@@ -184,7 +186,7 @@ const fetchAudioRange = async (audioUrl, startByte, endByte) => {
   return null;
 };
 
-// ACOUSTIC SILENCE SNAPPING: Finds the quietest pause within +/- 2.5s of targetSec
+// ACOUSTIC SILENCE SNAPPING: Finds the quietest pause within +/- searchRadiusSec of targetSec
 const snapToNearestSilence = async (audioBufferData, targetSec, chunkStartSec, searchRadiusSec = 2.5) => {
   if (!audioBufferData) return targetSec;
   try {
@@ -263,6 +265,10 @@ export default function App() {
   const [episodeFilterQuery, setEpisodeFilterQuery] = useState('');
 
   const [isPlaying, setIsPlaying] = useState(false);
+  const [playbackSpeed, setPlaybackSpeed] = useState(() => {
+    const saved = Number(localStorage.getItem('skipcast_playback_speed'));
+    return PLAYBACK_SPEEDS.includes(saved) ? saved : 1;
+  });
   const [currentTime, setCurrentTime] = useState(0);
   const [scrubTime, setScrubTime] = useState(null);
   const [duration, setDuration] = useState(1800);
@@ -272,6 +278,10 @@ export default function App() {
 
   const [autoSkip, setAutoSkip] = useState(true);
   const [playChime, setPlayChime] = useState(true);
+  const [boundaryPaddingSec, setBoundaryPaddingSec] = useState(() => {
+    const saved = Number(localStorage.getItem('skipcast_boundary_padding'));
+    return !isNaN(saved) && saved >= 0 && saved <= 3 ? saved : 0.4;
+  });
   const [adsSkippedCount, setAdsSkippedCount] = useState(() => Number(localStorage.getItem('skipcast_skipped_count')) || 0);
   const [timeSavedSec, setTimeSavedSec] = useState(() => Number(localStorage.getItem('skipcast_saved_sec')) || 0);
   const [skipBanner, setSkipBanner] = useState(null);
@@ -309,6 +319,7 @@ export default function App() {
   const shouldAutoPlayNextRef = useRef(false);
   const progressBarRef = useRef(null);
   const isDraggingRef = useRef(false);
+  const cancelScanRef = useRef(false);
 
   const currentEp = episodes.find(e => e.id === currentEpId) || episodes[0];
 
@@ -343,6 +354,17 @@ export default function App() {
   }, [apiKey]);
 
   useEffect(() => {
+    localStorage.setItem('skipcast_playback_speed', String(playbackSpeed));
+    if (audioRef.current) {
+      audioRef.current.playbackRate = playbackSpeed;
+    }
+  }, [playbackSpeed]);
+
+  useEffect(() => {
+    localStorage.setItem('skipcast_boundary_padding', String(boundaryPaddingSec));
+  }, [boundaryPaddingSec]);
+
+  useEffect(() => {
     getAllOfflineKeys().then(keys => setOfflineIds(keys));
   }, []);
 
@@ -375,6 +397,7 @@ export default function App() {
           setPlayingOfflineBlob(false);
         }
         if (!isCancelled) {
+          audioRef.current.playbackRate = playbackSpeed;
           audioRef.current.load();
           if (shouldAutoPlayNextRef.current) {
             shouldAutoPlayNextRef.current = false;
@@ -388,6 +411,7 @@ export default function App() {
         if (!isCancelled) {
           audioRef.current.src = currentEp.audioUrl || '';
           setPlayingOfflineBlob(false);
+          audioRef.current.playbackRate = playbackSpeed;
           audioRef.current.load();
         }
       }
@@ -403,7 +427,7 @@ export default function App() {
     const metaPayload = {
       title: currentEp.title || 'SkipCast Episode',
       artist: currentEp.podcast || 'SkipCast AI Player',
-      album: autoSkip ? 'SkipCast • Auto-Skip ON' : 'SkipCast • Auto-Skip OFF',
+      album: `${playbackSpeed}x • ${autoSkip ? 'Auto-Skip ON' : 'Auto-Skip OFF'}`,
       artwork: [{ src: artUrl, sizes: '512x512', type: 'image/jpeg' }]
     };
 
@@ -414,6 +438,7 @@ export default function App() {
           await NativeMedia.setMetadata(metaPayload);
           await NativeMedia.setActionHandler({ action: 'play' }, async () => {
             if (audioRef.current) {
+              audioRef.current.playbackRate = playbackSpeed;
               await audioRef.current.play();
               setIsPlaying(true);
             }
@@ -473,7 +498,7 @@ export default function App() {
         navigator.mediaSession.metadata = new window.MediaMetadata(metaPayload);
       } catch (_) {}
     }
-  }, [currentEp, autoSkip, duration]);
+  }, [currentEp, autoSkip, duration, playbackSpeed]);
 
   useEffect(() => {
     const stateStr = isPlaying ? 'playing' : 'paused';
@@ -534,7 +559,7 @@ export default function App() {
           try {
             NativeMedia.setPositionState({
               duration: validDur,
-              playbackRate: audio.playbackRate || 1.0,
+              playbackRate: audio.playbackRate || playbackSpeed,
               position: now
             });
           } catch (_) {}
@@ -563,6 +588,7 @@ export default function App() {
   const handleLoadedMetadata = () => {
     const audio = audioRef.current;
     if (!audio) return;
+    audio.playbackRate = playbackSpeed;
     const realDur = audio.duration;
     if (realDur && isFinite(realDur) && realDur > 0) {
       setDuration(realDur);
@@ -579,6 +605,7 @@ export default function App() {
       setIsPlaying(false);
     } else {
       try {
+        audio.playbackRate = playbackSpeed;
         await audio.play();
         setIsPlaying(true);
       } catch (err) {
@@ -648,6 +675,7 @@ export default function App() {
     seekTo(target);
     if (!isPlaying && audioRef.current) {
       try {
+        audioRef.current.playbackRate = playbackSpeed;
         await audioRef.current.play();
         setIsPlaying(true);
       } catch (_) {}
@@ -746,6 +774,7 @@ export default function App() {
         activeBlobUrlRef.current = blobUrl;
         const wasTime = audioRef.current.currentTime;
         audioRef.current.src = blobUrl;
+        audioRef.current.playbackRate = playbackSpeed;
         audioRef.current.currentTime = wasTime;
         setPlayingOfflineBlob(true);
       }
@@ -1132,8 +1161,14 @@ ${outlinesXml}
     setActiveTab('player');
   };
 
-  // FULL-EPISODE DAI-AWARE SCANNER + NEGATIVE REPORT FILTER + SILENCE SNAPPING + RESCAN MERGE
+  const cancelActiveScan = () => {
+    cancelScanRef.current = true;
+    setScanStage('Canceling scan...');
+  };
+
+  // TWO-STAGE AD SCANNER: Stage 1 Candidate & DAI Pass -> Stage 2 Silence Snapping + Boundary Padding
   const runAiAdScan = async () => {
+    cancelScanRef.current = false;
     setIsScanning(true);
     setAudioError(null);
     const epDur = duration > 60 ? duration : (currentEp.duration || 1800);
@@ -1159,7 +1194,7 @@ ${outlinesXml}
 
     try {
       if (!apiKey.trim()) {
-        setAudioError('Add a Gemini API key in Settings to run full-episode ad detection. You can also add custom start/end seconds manually below.');
+        setAudioError('Add a Gemini API key in Settings to run two-stage ad detection. You can also add custom start/end seconds manually below.');
         setEpisodes(prev => prev.map(ep => ep.id === currentEp.id ? { ...ep, scanned: true, ads: ep.ads || [] } : ep));
         return;
       }
@@ -1168,12 +1203,14 @@ ${outlinesXml}
         const models = ['gemini-3.8-flash', 'gemini-3.5-flash-lite'];
         let lastErrMsg = '';
         for (const model of models) {
+          if (cancelScanRef.current) return { ok: false, error: 'Scan canceled' };
           const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey.trim()}`;
           const body = JSON.stringify({
             contents: [{ parts }],
             generationConfig: { responseMimeType: 'application/json' }
           });
           for (let attempt = 0; attempt < 2; attempt++) {
+            if (cancelScanRef.current) return { ok: false, error: 'Scan canceled' };
             const r = await fetch(endpoint, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
@@ -1185,13 +1222,14 @@ ${outlinesXml}
             if (r.status !== 503 && r.status !== 429) {
               return { ok: false, error: lastErrMsg };
             }
-            await new Promise((res) => setTimeout(res, 1400 * (attempt + 1)));
+            await new Promise((res) => setTimeout(res, 1300 * (attempt + 1)));
           }
         }
         return { ok: false, error: lastErrMsg };
       };
 
-      const windowBytes = 4200000;
+      // ~6.2 MB per window (~8.3 MB base64, well below inline limits) for fewer passes on long shows
+      const windowBytes = 6200000;
       const offlineBlob = await getEpisodeBlob(currentEp.id).catch(() => null);
       let fullOfflineBuf = null;
       let totalFileBytes = null;
@@ -1200,7 +1238,7 @@ ${outlinesXml}
         fullOfflineBuf = await offlineBlob.arrayBuffer();
         totalFileBytes = fullOfflineBuf.byteLength;
       } else if (currentEp.audioUrl) {
-        setScanStage('Checking full episode audio size...');
+        setScanStage('Stage 1/2: Probing episode audio size...');
         const probe = await fetchAudioRange(currentEp.audioUrl, 0, windowBytes - 1);
         if (probe?.totalBytes) totalFileBytes = probe.totalBytes;
       }
@@ -1210,21 +1248,23 @@ ${outlinesXml}
         ? Math.max(1, Math.ceil(totalFileBytes / windowBytes))
         : Math.max(1, Math.ceil((epDur * bytesPerSec) / windowBytes));
 
-      const collectedAds = [...preservedManualAds];
+      const candidateAds = [];
+      const windowBuffersBySec = [];
       let startByte = 0;
       let windowIndex = 0;
       let hitEndOfFile = false;
       let anyAudioScanned = false;
       let failedWindowsCount = 0;
 
-      while (!hitEndOfFile && windowIndex < 30) {
+      // STAGE 1: Triage & DAI / Ad Detection across windows
+      while (!hitEndOfFile && windowIndex < 24 && !cancelScanRef.current) {
         windowIndex++;
         const endByte = startByte + windowBytes - 1;
         const winStartSec = Math.round(startByte / bytesPerSec);
         const winEndSec = Math.min(Math.round(epDur), Math.round(endByte / bytesPerSec));
 
         setScanStage(
-          `Scanning (${windowIndex}/${estimatedTotalWindows}): ${formatTime(winStartSec)} - ${formatTime(winEndSec)}...`
+          `Stage 1/2 Triage (${windowIndex}/${estimatedTotalWindows}): ${formatTime(winStartSec)} - ${formatTime(winEndSec)}...`
         );
 
         let chunkBuf = null;
@@ -1262,20 +1302,21 @@ ${outlinesXml}
         }
 
         anyAudioScanned = true;
+        windowBuffersBySec.push({ winStartSec, winEndSec, chunkBuf });
         const chunkBase64 = arrayBufferToBase64(chunkBuf);
 
-        const promptText = `You are a precision podcast ad and Dynamic Ad Insertion (DAI) boundary detector analyzing a sequential segment of a full podcast episode.
+        const promptText = `You are a two-stage podcast ad and Dynamic Ad Insertion (DAI) triage detector.
 Episode Title: "${currentEp.title}"
 Full Episode Duration: ${Math.round(epDur)} seconds
 Show Notes: "${(currentEp.rawNotes || 'None provided').slice(0, 1000)}"
 
-This attached audio clip covers approximately ${winStartSec}s to ${winEndSec}s of the episode (clip starts at ~${winStartSec}s).
-Watch closely for both host-read sponsorships AND Dynamic Ad Insertion (DAI) / client-side stitched commercials, including:
-- Sudden loudness/compression jumps or mastering shifts between main speech and a commercial break
-- Abrupt room-tone drops, music-bed swaps, or transition stingers/jingles
-- Promo codes, sponsor URLs, or commercial call-to-action phrasing ("use code", "sponsored by", "brought to you by")
-Do NOT output items when no ads are present in this clip.
-Convert timestamps within this clip into full-episode seconds by adding ~${winStartSec}s so startTime and endTime are in full-episode seconds (0 to ${Math.round(epDur)}).
+Attached audio covers approximately ${winStartSec}s to ${winEndSec}s of the episode (starts at ~${winStartSec}s).
+Detect candidate sponsor reads and dynamically inserted/stitched ads by looking for:
+- Sudden loudness/compression shifts, room-tone drops, or music-bed transitions
+- Abrupt acoustic/vocal splice boundaries around pre-roll, mid-roll, or late-roll breaks
+- Promo codes, sponsor names/URLs, or commercial call-to-action phrasing
+Do NOT return items if no ads or ad breaks are present in this window.
+Convert clip-relative times to full-episode seconds by adding ~${winStartSec}s (range 0 to ${Math.round(epDur)}).
 Return ONLY a valid JSON array:
 [
   {
@@ -1284,7 +1325,7 @@ Return ONLY a valid JSON array:
     "sponsor": "<string>",
     "category": "<Pre-Roll | Mid-Roll | Late-Roll | DAI Stitch | Sponsor Read>",
     "confidence": <number 0.5 to 0.99>,
-    "reason": "<brief acoustic/DAI cue>"
+    "reason": "<brief transition or ad cue>"
   }
 ]`;
 
@@ -1293,41 +1334,36 @@ Return ONLY a valid JSON array:
           { inlineData: { mimeType: 'audio/mp3', data: chunkBase64 } }
         ]);
 
+        if (cancelScanRef.current) break;
+
         if (!geminiResult.ok) {
           failedWindowsCount++;
           if (failedWindowsCount >= 2 || !String(geminiResult.error).includes('high demand')) {
             setAudioError(`Gemini Error: ${geminiResult.error}`);
             break;
           }
-          await new Promise((res) => setTimeout(res, 1500));
+          await new Promise((res) => setTimeout(res, 1400));
         } else {
           const rawJson = geminiResult.data?.candidates?.[0]?.content?.parts?.[0]?.text;
           if (rawJson) {
             const cleaned = rawJson.replace(/```json|```/g, '').trim();
             const parsed = JSON.parse(cleaned);
             if (Array.isArray(parsed) && parsed.length > 0) {
-              setScanStage(`Snapping boundaries (${formatTime(winStartSec)} - ${formatTime(winEndSec)})...`);
               for (let i = 0; i < parsed.length; i++) {
                 const item = parsed[i];
                 if (isNegativeReport(item)) continue;
+                const rawStart = Math.max(0, Math.round(Number(item.startTime) || 0));
+                const rawEnd = Math.min(Math.round(epDur), Math.round(Number(item.endTime) || 0));
+                if (rawEnd <= rawStart || (rawEnd - rawStart) < 5) continue;
 
-                let s = Math.max(0, Math.round(Number(item.startTime) || 0));
-                let e = Math.min(Math.round(epDur), Math.round(Number(item.endTime) || 0));
-                if (e <= s || (e - s) < 5) continue;
-
-                const snappedStart = await snapToNearestSilence(chunkBuf, s, winStartSec);
-                const snappedEnd = await snapToNearestSilence(chunkBuf, e, winStartSec);
-                s = Math.min(snappedStart, snappedEnd - 1);
-                e = Math.max(snappedEnd, s + 1);
-
-                collectedAds.push({
-                  id: `gemini-full-${Date.now()}-${windowIndex}-${i}`,
-                  startTime: s,
-                  endTime: e,
+                candidateAds.push({
+                  id: `gemini-2stage-${Date.now()}-${windowIndex}-${i}`,
+                  startTime: rawStart,
+                  endTime: rawEnd,
                   sponsor: item.sponsor || 'Sponsor Read',
-                  category: item.category || 'DAI / Full Scan',
+                  category: item.category || 'DAI / Two-Stage AI',
                   confidence: Number(item.confidence) || 0.9,
-                  reason: item.reason || `Detected in segment ${formatTime(winStartSec)}-${formatTime(winEndSec)}`,
+                  reason: item.reason || `Detected in ${formatTime(winStartSec)}-${formatTime(winEndSec)}`,
                   whitelisted: false
                 });
               }
@@ -1336,12 +1372,47 @@ Return ONLY a valid JSON array:
         }
 
         startByte += windowBytes;
-        if (!hitEndOfFile) {
-          await new Promise((res) => setTimeout(res, 650));
+        if (!hitEndOfFile && !cancelScanRef.current) {
+          await new Promise((res) => setTimeout(res, 550));
         }
       }
 
-      const sorted = collectedAds.sort((a, b) => a.startTime - b.startTime);
+      if (cancelScanRef.current) {
+        showToast('Scan canceled — existing markers kept');
+        return;
+      }
+
+      // STAGE 2: Silence snapping + safety boundary padding + deduplication
+      setScanStage(`Stage 2/2: Refining ${candidateAds.length} boundary pair(s) with silence snapping...`);
+      const refinedAds = [...preservedManualAds];
+
+      for (const cand of candidateAds) {
+        if (cancelScanRef.current) break;
+        const matchingWin = windowBuffersBySec.find(
+          w => cand.startTime >= w.winStartSec - 5 && cand.startTime <= w.winEndSec + 5
+        ) || windowBuffersBySec[0];
+
+        let snappedStart = cand.startTime;
+        let snappedEnd = cand.endTime;
+
+        if (matchingWin?.chunkBuf) {
+          snappedStart = await snapToNearestSilence(matchingWin.chunkBuf, cand.startTime, matchingWin.winStartSec);
+          snappedEnd = await snapToNearestSilence(matchingWin.chunkBuf, cand.endTime, matchingWin.winStartSec);
+        }
+
+        const paddedStart = Math.max(0, Math.round((snappedStart + boundaryPaddingSec) * 10) / 10);
+        const paddedEnd = Math.min(Math.round(epDur), Math.max(paddedStart + 1, Math.round((snappedEnd - boundaryPaddingSec) * 10) / 10));
+
+        if (paddedEnd > paddedStart && (paddedEnd - paddedStart) >= 4) {
+          refinedAds.push({
+            ...cand,
+            startTime: paddedStart,
+            endTime: paddedEnd
+          });
+        }
+      }
+
+      const sorted = refinedAds.sort((a, b) => a.startTime - b.startTime);
       const mergedAds = [];
       for (const ad of sorted) {
         const prev = mergedAds[mergedAds.length - 1];
@@ -1361,13 +1432,14 @@ Return ONLY a valid JSON array:
       if (!anyAudioScanned) {
         showToast('Could not read audio stream (try Download Offline first)');
       } else if (mergedAds.length > 0) {
-        showToast(`Scan complete (${windowIndex} windows): ${mergedAds.length} ad segment${mergedAds.length > 1 ? 's' : ''} ready`);
+        showToast(`Two-stage scan complete: ${mergedAds.length} ad segment${mergedAds.length > 1 ? 's' : ''} ready`);
       } else {
-        showToast(`Scan complete (${windowIndex} windows checked): 0 ads flagged`);
+        showToast(`Two-stage scan complete (${windowIndex} window${windowIndex === 1 ? '' : 's'} checked): 0 ads flagged`);
       }
     } catch (_) {
-      setAudioError('Full-episode scan interrupted. Your existing markers and manual ranges were kept.');
+      setAudioError('Two-stage scan interrupted. Your existing markers and manual ranges were kept.');
     } finally {
+      cancelScanRef.current = false;
       setIsScanning(false);
       setScanStage('');
     }
@@ -1411,13 +1483,16 @@ Return ONLY a valid JSON array:
   const displayedTime = scrubTime !== null ? scrubTime : currentTime;
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col pb-32">
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col pb-36">
       <audio
         ref={audioRef}
         onTimeUpdate={handleTimeUpdate}
         onLoadedMetadata={handleLoadedMetadata}
         onDurationChange={handleLoadedMetadata}
-        onPlay={() => setIsPlaying(true)}
+        onPlay={() => {
+          if (audioRef.current) audioRef.current.playbackRate = playbackSpeed;
+          setIsPlaying(true);
+        }}
         onPause={() => setIsPlaying(false)}
         onEnded={handleEpisodeEnded}
         onError={() => setAudioError('Stream error: Check connection or use Download Offline.')}
@@ -1433,10 +1508,10 @@ Return ONLY a valid JSON array:
             <h1 className="font-bold text-base tracking-tight flex items-center gap-2">
               SkipCast
               <span className="text-[10px] font-semibold uppercase px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                v6.10 DAI & Rescan
+                v6.11 Two-Stage DAI
               </span>
             </h1>
-            <p className="text-xs text-slate-400">DAI Ad Detection, Full Scan & Smooth Scrubbing</p>
+            <p className="text-xs text-slate-400">Two-Stage DAI Scan, Silence Snapping & Speed Control</p>
           </div>
         </div>
 
@@ -1558,38 +1633,61 @@ Return ONLY a valid JSON array:
                 <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl p-3 space-y-2.5">
                   <span className="text-xs text-amber-200 font-medium flex items-center gap-1.5">
                     <AlertTriangle className="w-4 h-4 text-amber-400" />
-                    Full-episode scan checks every segment for DAI stitches & ads ({formatTime(duration)})
+                    Two-stage scan detects DAI stitches & refines boundaries ({formatTime(duration)})
                   </span>
-                  <button
-                    onClick={runAiAdScan}
-                    disabled={isScanning}
-                    className="w-full py-2 px-3 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs flex items-center justify-center gap-2 transition"
-                  >
-                    {isScanning ? (
-                      <>
-                        <RefreshCw className="w-4 h-4 animate-spin" />
-                        {scanStage}
-                      </>
-                    ) : (
-                      <>
-                        <Sparkles className="w-4 h-4" />
-                        Scan Full Episode with Gemini
-                      </>
-                    )}
-                  </button>
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  <div className="text-xs font-semibold text-slate-400 flex items-center justify-between">
-                    <span>Detected Ad Segments ({currentEp.ads?.length || 0})</span>
+                  <div className="flex items-center gap-2">
                     <button
                       onClick={runAiAdScan}
                       disabled={isScanning}
-                      className="text-[11px] text-emerald-400 underline flex items-center gap-1"
+                      className="flex-1 py-2 px-3 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs flex items-center justify-center gap-2 transition"
                     >
-                      {isScanning ? <RefreshCw className="w-3 h-3 animate-spin" /> : null}
-                      {isScanning ? (scanStage || 'Scanning...') : 'Re-Scan Full Episode'}
+                      {isScanning ? (
+                        <>
+                          <RefreshCw className="w-4 h-4 animate-spin shrink-0" />
+                          <span className="truncate">{scanStage}</span>
+                        </>
+                      ) : (
+                        <>
+                          <Sparkles className="w-4 h-4" />
+                          Run Two-Stage Ad Scan
+                        </>
+                      )}
                     </button>
+                    {isScanning && (
+                      <button
+                        type="button"
+                        onClick={cancelActiveScan}
+                        className="py-2 px-3 rounded-lg bg-slate-800 hover:bg-rose-500/20 text-slate-200 hover:text-rose-300 border border-slate-700 font-semibold text-xs flex items-center gap-1 shrink-0"
+                      >
+                        <XCircle className="w-4 h-4" />
+                        Cancel
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <div className="text-xs font-semibold text-slate-400 flex items-center justify-between gap-2">
+                    <span>Detected Ad Segments ({currentEp.ads?.length || 0})</span>
+                    <div className="flex items-center gap-2">
+                      {isScanning && (
+                        <button
+                          type="button"
+                          onClick={cancelActiveScan}
+                          className="text-[11px] text-rose-300 underline flex items-center gap-1"
+                        >
+                          <XCircle className="w-3 h-3" /> Cancel
+                        </button>
+                      )}
+                      <button
+                        onClick={runAiAdScan}
+                        disabled={isScanning}
+                        className="text-[11px] text-emerald-400 underline flex items-center gap-1 truncate max-w-[210px]"
+                      >
+                        {isScanning ? <RefreshCw className="w-3 h-3 animate-spin shrink-0" /> : null}
+                        <span className="truncate">{isScanning ? (scanStage || 'Scanning...') : 'Re-Scan Full Episode'}</span>
+                      </button>
+                    </div>
                   </div>
                   {(currentEp.ads || []).length === 0 && (
                     <p className="text-xs text-slate-400 bg-slate-950/60 border border-slate-800 rounded-xl p-2.5">
@@ -2154,9 +2252,25 @@ Return ONLY a valid JSON array:
                 className="w-4 h-4 accent-emerald-500"
               />
             </div>
+
             <div>
               <label className="block text-xs text-slate-400 mb-1">
-                Gemini API Key (Used for Full-Episode Ad Analysis)
+                Boundary Safety Padding ({boundaryPaddingSec}s inward buffer after silence snap)
+              </label>
+              <input
+                type="range"
+                min="0"
+                max="2"
+                step="0.2"
+                value={boundaryPaddingSec}
+                onChange={e => setBoundaryPaddingSec(Number(e.target.value))}
+                className="w-full accent-emerald-500"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs text-slate-400 mb-1">
+                Gemini API Key (Used for Two-Stage DAI & Ad Analysis)
               </label>
               <input
                 type="password"
@@ -2170,7 +2284,7 @@ Return ONLY a valid JSON array:
         )}
       </main>
 
-      {/* Sticky Player Bar with Smooth Drag Scrubbing */}
+      {/* Sticky Player Bar with Smooth Drag Scrubbing & Speed Controls */}
       <div className="fixed bottom-0 left-0 right-0 bg-slate-900/95 backdrop-blur border-t border-slate-800 p-3 z-30">
         <div className="max-w-3xl mx-auto space-y-2">
           <div
@@ -2206,11 +2320,12 @@ Return ONLY a valid JSON array:
             />
           </div>
 
-          <div className="flex items-center justify-between text-xs">
+          <div className="flex items-center justify-between text-xs gap-2">
             <span className={`font-mono ${scrubTime !== null ? 'text-emerald-400 font-bold' : 'text-slate-400'}`}>
               {formatTime(displayedTime)}
             </span>
-            <div className="flex items-center gap-4">
+
+            <div className="flex items-center gap-3">
               <button onClick={() => seekTo(currentTime - 15)} className="p-1.5 text-slate-300 hover:text-white">
                 <Rewind className="w-4 h-4" />
               </button>
@@ -2235,7 +2350,26 @@ Return ONLY a valid JSON array:
                 {isMuted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
               </button>
             </div>
-            <span className="font-mono text-slate-400">{formatTime(duration)}</span>
+
+            <div className="flex items-center gap-1.5">
+              <div className="flex items-center bg-slate-800 rounded-lg p-0.5 border border-slate-700">
+                {PLAYBACK_SPEEDS.map(spd => (
+                  <button
+                    key={spd}
+                    type="button"
+                    onClick={() => setPlaybackSpeed(spd)}
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold transition ${
+                      playbackSpeed === spd
+                        ? 'bg-emerald-500 text-slate-950'
+                        : 'text-slate-300 hover:text-white'
+                    }`}
+                  >
+                    {spd}x
+                  </button>
+                ))}
+              </div>
+              <span className="font-mono text-slate-400">{formatTime(duration)}</span>
+            </div>
           </div>
         </div>
       </div>
